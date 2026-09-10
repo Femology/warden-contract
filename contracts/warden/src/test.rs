@@ -2,7 +2,7 @@
 
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
-use crate::{storage, WardenContract, WardenContractClient, WardenError};
+use crate::{storage, Decision, StepUpReason, WardenContract, WardenContractClient, WardenError};
 
 fn setup<'a>() -> (Env, WardenContractClient<'a>, Address, Address, Address) {
     let env = Env::default();
@@ -201,4 +201,17 @@ fn set_policy_emits_policy_set_event_with_exact_topic_and_data_shape() {
             ),
         ]
     );
+}
+
+#[test]
+fn evaluate_allows_when_under_thresholds() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false);
+
+    let decision = client.evaluate(&wallet, &recipient, &500);
+    assert_eq!(decision, Decision::Allow);
 }
