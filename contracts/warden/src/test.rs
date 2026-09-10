@@ -144,3 +144,34 @@ fn add_trusted_recipient_fails_when_no_policy() {
     let result = client.try_add_trusted_recipient(&wallet, &recipient);
     assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
 }
+
+#[test]
+fn remove_trusted_recipient_succeeds() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+    client.add_trusted_recipient(&wallet, &recipient);
+    client.remove_trusted_recipient(&wallet, &recipient);
+
+    let policy = env
+        .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
+        .unwrap();
+
+    assert_eq!(policy.trusted_recipients.len(), 0);
+}
+
+#[test]
+fn remove_trusted_recipient_fails_when_not_trusted() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+
+    let result = client.try_remove_trusted_recipient(&wallet, &recipient);
+    assert_eq!(result, Err(Ok(WardenError::RecipientNotTrusted)));
+}
