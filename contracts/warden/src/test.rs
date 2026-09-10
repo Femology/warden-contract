@@ -293,3 +293,29 @@ fn evaluate_velocity_window_resets_after_24h() {
     let after_reset = client.evaluate(&wallet, &recipient, &1_000);
     assert_eq!(after_reset, Decision::Allow);
 }
+
+#[test]
+fn evaluate_velocity_accumulates_even_when_stepup_required() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false);
+
+    // This exceeds max_no_stepup, so it triggers step-up...
+    let decision = client.evaluate(&wallet, &recipient, &2_000);
+    assert_eq!(
+        decision,
+        Decision::RequireStepUp(StepUpReason::AmountExceeded)
+    );
+
+    // ...but the velocity window must still record the full amount. Otherwise
+    // someone could reset their effective velocity cap just by making every
+    // transfer trigger step-up.
+    let window = env
+        .as_contract(&contract_id, || storage::read_velocity(&env, &wallet))
+        .unwrap();
+    assert_eq!(window.cumulative_amount, 2_000);
+    assert_eq!(window.tx_count, 1);
+}
