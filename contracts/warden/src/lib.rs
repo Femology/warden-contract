@@ -1,6 +1,7 @@
 #![no_std]
 
 mod errors;
+mod storage;
 mod types;
 
 pub use errors::WardenError;
