@@ -8,8 +8,8 @@ use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 
 pub use errors::WardenError;
 pub use types::{
-    DataKey, Decision, Policy, PolicySetEvent, RecipientTrustedEvent, StepUpReason,
-    VelocityWindow,
+    DataKey, Decision, Policy, PolicySetEvent, RecipientTrustedEvent, RecipientUntrustedEvent,
+    StepUpReason, VelocityWindow,
 };
 
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -110,6 +110,31 @@ impl WardenContract {
         storage::write_policy(&env, &wallet, &policy);
 
         RecipientTrustedEvent { wallet, recipient }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn remove_trusted_recipient(
+        env: Env,
+        wallet: Address,
+        recipient: Address,
+    ) -> Result<(), WardenError> {
+        wallet.require_auth();
+
+        let mut policy =
+            storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
+
+        let index = policy
+            .trusted_recipients
+            .first_index_of(&recipient)
+            .ok_or(WardenError::RecipientNotTrusted)?;
+
+        policy.trusted_recipients.remove(index);
+        policy.updated_at = env.ledger().timestamp();
+
+        storage::write_policy(&env, &wallet, &policy);
+
+        RecipientUntrustedEvent { wallet, recipient }.publish(&env);
 
         Ok(())
     }

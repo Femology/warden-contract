@@ -62,3 +62,11 @@ pub struct RecipientTrustedEvent {
     pub wallet: Address,
     pub recipient: Address,
 }
+
+#[contractevent(data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientUntrustedEvent {
+    #[topic]
+    pub wallet: Address,
+    pub recipient: Address,
+}
