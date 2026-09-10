@@ -101,3 +101,46 @@ fn set_policy_rejects_velocity_cap_below_max_no_stepup() {
     let result = client.try_set_policy(&wallet, &5_000, &1_000, &true);
     assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
 }
+
+#[test]
+fn add_trusted_recipient_succeeds() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+    client.add_trusted_recipient(&wallet, &recipient);
+
+    let policy = env
+        .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
+        .unwrap();
+
+    assert_eq!(policy.trusted_recipients.len(), 1);
+    assert_eq!(policy.trusted_recipients.get(0).unwrap(), recipient);
+}
+
+#[test]
+fn add_trusted_recipient_fails_when_already_trusted() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+    client.add_trusted_recipient(&wallet, &recipient);
+
+    let result = client.try_add_trusted_recipient(&wallet, &recipient);
+    assert_eq!(result, Err(Ok(WardenError::RecipientAlreadyTrusted)));
+}
+
+#[test]
+fn add_trusted_recipient_fails_when_no_policy() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let result = client.try_add_trusted_recipient(&wallet, &recipient);
+    assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
+}
