@@ -4,10 +4,10 @@ mod errors;
 mod storage;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 
 pub use errors::WardenError;
-pub use types::{DataKey, Decision, Policy, StepUpReason, VelocityWindow};
+pub use types::{DataKey, Decision, Policy, PolicySetEvent, StepUpReason, VelocityWindow};
 
 const DAY_IN_LEDGERS: u32 = 17280;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
@@ -71,14 +71,18 @@ impl WardenContract {
 
         storage::write_policy(&env, &wallet, &policy);
 
-        // env.events().publish is deprecated in favor of #[contractevent] in this
-        // SDK version, but is used deliberately here: warden-monitor decodes events
-        // against this exact literal (topic_symbols, data_tuple) shape, and the
-        // #[contractevent] macro would derive a different encoding. Keep this stable.
-        env.events().publish(
-            (Symbol::new(&env, "policy_set"), wallet),
-            (max_no_stepup, daily_velocity_cap, new_recipient_requires_stepup),
-        );
+        // Uses #[contractevent] (current API) rather than the deprecated
+        // env.events().publish. data_format = "vec" on PolicySetEvent keeps the
+        // on-chain wire shape positional: topics ("policy_set", wallet), data
+        // (max_no_stepup, daily_velocity_cap, new_recipient_requires_stepup),
+        // matching the exact shape warden-monitor's decoder is spec'd against.
+        PolicySetEvent {
+            wallet,
+            max_no_stepup,
+            daily_velocity_cap,
+            new_recipient_requires_stepup,
+        }
+        .publish(&env);
 
         Ok(())
     }

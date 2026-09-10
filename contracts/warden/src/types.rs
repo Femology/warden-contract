@@ -42,3 +42,15 @@ pub enum Decision {
     Allow,
     RequireStepUp(StepUpReason),
 }
+
+use soroban_sdk::contractevent;
+
+#[contractevent(data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicySetEvent {
+    #[topic]
+    pub wallet: Address,
+    pub max_no_stepup: i128,
+    pub daily_velocity_cap: i128,
+    pub new_recipient_requires_stepup: bool,
+}
