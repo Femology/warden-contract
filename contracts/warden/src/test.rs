@@ -346,3 +346,52 @@ fn evaluate_fails_when_amount_not_positive() {
     let negative_result = client.try_evaluate(&wallet, &recipient, &-5);
     assert_eq!(negative_result, Err(Ok(WardenError::InvalidAmount)));
 }
+
+#[test]
+fn get_policy_returns_configured_policy() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+
+    let policy = client.get_policy(&wallet);
+    assert_eq!(policy.max_no_stepup, 1_000);
+    assert_eq!(policy.daily_velocity_cap, 5_000);
+    assert!(policy.new_recipient_requires_stepup);
+}
+
+#[test]
+fn get_policy_fails_when_not_set() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let result = client.try_get_policy(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
+}
+
+#[test]
+fn get_velocity_returns_recorded_window() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false);
+    client.evaluate(&wallet, &recipient, &400);
+
+    let window = client.get_velocity(&wallet);
+    assert_eq!(window.cumulative_amount, 400);
+    assert_eq!(window.tx_count, 1);
+}
+
+#[test]
+fn get_velocity_returns_zeroed_window_when_no_activity() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let window = client.get_velocity(&wallet);
+
+    assert_eq!(window.window_start, 0);
+    assert_eq!(window.cumulative_amount, 0);
+    assert_eq!(window.tx_count, 0);
+}
