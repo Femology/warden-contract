@@ -2,9 +2,9 @@
 
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
-use crate::{WardenContract, WardenContractClient, WardenError};
+use crate::{storage, WardenContract, WardenContractClient, WardenError};
 
-fn setup<'a>() -> (Env, WardenContractClient<'a>, Address, Address) {
+fn setup<'a>() -> (Env, WardenContractClient<'a>, Address, Address, Address) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -14,22 +14,90 @@ fn setup<'a>() -> (Env, WardenContractClient<'a>, Address, Address) {
     let admin = Address::generate(&env);
     let reference_asset = Address::generate(&env);
 
-    (env, client, admin, reference_asset)
+    (env, client, contract_id, admin, reference_asset)
 }
 
 #[test]
 fn initialize_succeeds_on_first_call() {
-    let (_env, client, admin, reference_asset) = setup();
+    let (_env, client, _contract_id, admin, reference_asset) = setup();
 
     client.initialize(&admin, &reference_asset);
 }
 
 #[test]
 fn initialize_fails_when_already_initialized() {
-    let (_env, client, admin, reference_asset) = setup();
+    let (_env, client, _contract_id, admin, reference_asset) = setup();
 
     client.initialize(&admin, &reference_asset);
 
     let result = client.try_initialize(&admin, &reference_asset);
     assert_eq!(result, Err(Ok(WardenError::AlreadyInitialized)));
+}
+
+#[test]
+fn set_policy_creates_new_policy() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+
+    let policy = env
+        .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
+        .expect("policy should exist after set_policy");
+
+    assert_eq!(policy.owner, wallet);
+    assert_eq!(policy.max_no_stepup, 1_000);
+    assert_eq!(policy.daily_velocity_cap, 5_000);
+    assert!(policy.new_recipient_requires_stepup);
+    assert_eq!(policy.trusted_recipients.len(), 0);
+}
+
+#[test]
+fn set_policy_updates_existing_policy_without_touching_trusted_recipients() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &true);
+
+    // Seed a trusted recipient directly through the storage layer, since
+    // add_trusted_recipient does not exist yet at this point in the build
+    // sequence (it lands in the next commit). This test only needs to prove
+    // that set_policy leaves an existing trusted_recipients list untouched.
+    env.as_contract(&contract_id, || {
+        let mut policy = storage::read_policy(&env, &wallet).unwrap();
+        policy.trusted_recipients.push_back(recipient.clone());
+        storage::write_policy(&env, &wallet, &policy);
+    });
+
+    client.set_policy(&wallet, &2_000, &9_000, &false);
+
+    let policy = env
+        .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
+        .expect("policy should exist after update");
+
+    assert_eq!(policy.max_no_stepup, 2_000);
+    assert_eq!(policy.daily_velocity_cap, 9_000);
+    assert!(!policy.new_recipient_requires_stepup);
+    assert_eq!(policy.trusted_recipients.len(), 1);
+    assert_eq!(policy.trusted_recipients.get(0).unwrap(), recipient);
+}
+
+#[test]
+fn set_policy_rejects_negative_max_no_stepup() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let result = client.try_set_policy(&wallet, &-1, &5_000, &true);
+    assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
+}
+
+#[test]
+fn set_policy_rejects_velocity_cap_below_max_no_stepup() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let result = client.try_set_policy(&wallet, &5_000, &1_000, &true);
+    assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
 }
