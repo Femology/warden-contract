@@ -244,3 +244,25 @@ fn evaluate_requires_stepup_when_amount_exceeds_max() {
         Decision::RequireStepUp(StepUpReason::AmountExceeded)
     );
 }
+
+#[test]
+fn evaluate_requires_stepup_when_velocity_cap_exceeded() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &1_500, &false);
+
+    // First transfer: under max_no_stepup and under the daily cap -> Allow.
+    let first = client.evaluate(&wallet, &recipient, &1_000);
+    assert_eq!(first, Decision::Allow);
+
+    // Second transfer: 600 is under max_no_stepup on its own, but cumulative
+    // spend (1000 + 600 = 1600) exceeds the daily cap of 1500.
+    let second = client.evaluate(&wallet, &recipient, &600);
+    assert_eq!(
+        second,
+        Decision::RequireStepUp(StepUpReason::VelocityExceeded)
+    );
+}
