@@ -211,6 +211,10 @@ impl WardenContract {
 
         Ok(decision)
     }
+
+    pub fn get_policy(env: Env, wallet: Address) -> Result<Policy, WardenError> {
+        storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)
+    }
 }
 
 #[cfg(test)]
