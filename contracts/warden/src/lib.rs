@@ -7,7 +7,10 @@ mod types;
 use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 
 pub use errors::WardenError;
-pub use types::{DataKey, Decision, Policy, PolicySetEvent, StepUpReason, VelocityWindow};
+pub use types::{
+    DataKey, Decision, Policy, PolicySetEvent, RecipientTrustedEvent, StepUpReason,
+    VelocityWindow,
+};
 
 const DAY_IN_LEDGERS: u32 = 17280;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
@@ -83,6 +86,30 @@ impl WardenContract {
             new_recipient_requires_stepup,
         }
         .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn add_trusted_recipient(
+        env: Env,
+        wallet: Address,
+        recipient: Address,
+    ) -> Result<(), WardenError> {
+        wallet.require_auth();
+
+        let mut policy =
+            storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
+
+        if policy.trusted_recipients.contains(&recipient) {
+            return Err(WardenError::RecipientAlreadyTrusted);
+        }
+
+        policy.trusted_recipients.push_back(recipient.clone());
+        policy.updated_at = env.ledger().timestamp();
+
+        storage::write_policy(&env, &wallet, &policy);
+
+        RecipientTrustedEvent { wallet, recipient }.publish(&env);
 
         Ok(())
     }

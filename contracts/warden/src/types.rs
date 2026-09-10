@@ -54,3 +54,11 @@ pub struct PolicySetEvent {
     pub daily_velocity_cap: i128,
     pub new_recipient_requires_stepup: bool,
 }
+
+#[contractevent(data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecipientTrustedEvent {
+    #[topic]
+    pub wallet: Address,
+    pub recipient: Address,
+}
