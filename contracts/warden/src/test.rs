@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, Env};
 
 use crate::{storage, Decision, StepUpReason, WardenContract, WardenContractClient, WardenError};
 
@@ -265,4 +265,31 @@ fn evaluate_requires_stepup_when_velocity_cap_exceeded() {
         second,
         Decision::RequireStepUp(StepUpReason::VelocityExceeded)
     );
+}
+
+#[test]
+fn evaluate_velocity_window_resets_after_24h() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &1_000, &false);
+
+    let first = client.evaluate(&wallet, &recipient, &1_000);
+    assert_eq!(first, Decision::Allow);
+
+    // A second transfer right away would exceed the daily cap.
+    let blocked = client.evaluate(&wallet, &recipient, &1_000);
+    assert_eq!(
+        blocked,
+        Decision::RequireStepUp(StepUpReason::VelocityExceeded)
+    );
+
+    // Advance the ledger clock by exactly one day: the window resets.
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 86_400);
+
+    let after_reset = client.evaluate(&wallet, &recipient, &1_000);
+    assert_eq!(after_reset, Decision::Allow);
 }
