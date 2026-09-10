@@ -147,3 +147,4 @@ Testnet deployment is a later phase, not part of this repo's build sequence.
 This contract does not: move funds, call other contracts, support multiple assets,
 register itself as a smart-wallet signer, or let anyone but a wallet's own owner change
 that wallet's policy. Each of these was considered and deliberately left out of v1.
+# test
