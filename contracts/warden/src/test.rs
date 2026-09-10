@@ -228,3 +228,19 @@ fn evaluate_requires_stepup_for_new_recipient() {
     let decision = client.evaluate(&wallet, &recipient, &500);
     assert_eq!(decision, Decision::RequireStepUp(StepUpReason::NewRecipient));
 }
+
+#[test]
+fn evaluate_requires_stepup_when_amount_exceeds_max() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false);
+
+    let decision = client.evaluate(&wallet, &recipient, &1_500);
+    assert_eq!(
+        decision,
+        Decision::RequireStepUp(StepUpReason::AmountExceeded)
+    );
+}
