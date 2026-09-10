@@ -175,3 +175,30 @@ fn remove_trusted_recipient_fails_when_not_trusted() {
     let result = client.try_remove_trusted_recipient(&wallet, &recipient);
     assert_eq!(result, Err(Ok(WardenError::RecipientNotTrusted)));
 }
+
+#[test]
+fn set_policy_emits_policy_set_event_with_exact_topic_and_data_shape() {
+    use soroban_sdk::{testutils::Events as _, vec as svec, IntoVal, Symbol, Val};
+
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000i128, &5_000i128, &true);
+
+    let mut data: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
+    data.push_back(1_000i128.into_val(&env));
+    data.push_back(5_000i128.into_val(&env));
+    data.push_back(true.into_val(&env));
+
+    assert_eq!(
+        env.events().all(),
+        svec![
+            &env,
+            (
+                contract_id.clone(),
+                (Symbol::new(&env, "policy_set"), wallet.clone()).into_val(&env),
+                data.into_val(&env),
+            ),
+        ]
+    );
+}

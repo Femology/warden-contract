@@ -45,7 +45,7 @@ pub enum Decision {
 
 use soroban_sdk::contractevent;
 
-#[contractevent(data_format = "vec")]
+#[contractevent(topics = ["policy_set"], data_format = "vec")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolicySetEvent {
     #[topic]
@@ -55,7 +55,7 @@ pub struct PolicySetEvent {
     pub new_recipient_requires_stepup: bool,
 }
 
-#[contractevent(data_format = "single-value")]
+#[contractevent(topics = ["recipient_trusted"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecipientTrustedEvent {
     #[topic]
@@ -63,10 +63,29 @@ pub struct RecipientTrustedEvent {
     pub recipient: Address,
 }
 
-#[contractevent(data_format = "single-value")]
+#[contractevent(topics = ["recipient_untrusted"], data_format = "single-value")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecipientUntrustedEvent {
     #[topic]
     pub wallet: Address,
     pub recipient: Address,
+}
+
+#[contractevent(topics = ["eval_allowed"], data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvaluationAllowedEvent {
+    #[topic]
+    pub wallet: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contractevent(topics = ["stepup_req"], data_format = "vec")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StepupRequiredEvent {
+    #[topic]
+    pub wallet: Address,
+    pub recipient: Address,
+    pub amount: i128,
+    pub reason: StepUpReason,
 }
