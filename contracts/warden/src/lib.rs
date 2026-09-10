@@ -215,6 +215,15 @@ impl WardenContract {
     pub fn get_policy(env: Env, wallet: Address) -> Result<Policy, WardenError> {
         storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)
     }
+
+    pub fn get_velocity(env: Env, wallet: Address) -> Result<VelocityWindow, WardenError> {
+        let window = storage::read_velocity(&env, &wallet).unwrap_or(VelocityWindow {
+            window_start: 0,
+            cumulative_amount: 0,
+            tx_count: 0,
+        });
+        Ok(window)
+    }
 }
 
 #[cfg(test)]
