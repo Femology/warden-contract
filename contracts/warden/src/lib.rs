@@ -8,11 +8,12 @@ use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
 
 pub use errors::WardenError;
 pub use types::{
-    DataKey, Decision, Policy, PolicySetEvent, RecipientTrustedEvent, RecipientUntrustedEvent,
-    StepUpReason, VelocityWindow,
+    DataKey, Decision, EvaluationAllowedEvent, Policy, PolicySetEvent, RecipientTrustedEvent,
+    RecipientUntrustedEvent, StepUpReason, StepupRequiredEvent, VelocityWindow,
 };
 
 const DAY_IN_LEDGERS: u32 = 17280;
+const SECONDS_PER_DAY: u64 = 86400;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 60;
 
@@ -137,6 +138,78 @@ impl WardenContract {
         RecipientUntrustedEvent { wallet, recipient }.publish(&env);
 
         Ok(())
+    }
+
+    pub fn evaluate(
+        env: Env,
+        wallet: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<Decision, WardenError> {
+        wallet.require_auth();
+
+        let policy =
+            storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
+
+        if amount <= 0 {
+            return Err(WardenError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut window = storage::read_velocity(&env, &wallet).unwrap_or(VelocityWindow {
+            window_start: 0,
+            cumulative_amount: 0,
+            tx_count: 0,
+        });
+
+        if now - window.window_start >= SECONDS_PER_DAY {
+            window.window_start = now;
+            window.cumulative_amount = 0;
+            window.tx_count = 0;
+        }
+
+        let decision = if policy.new_recipient_requires_stepup
+            && !policy.trusted_recipients.contains(&recipient)
+        {
+            Decision::RequireStepUp(StepUpReason::NewRecipient)
+        } else if amount > policy.max_no_stepup {
+            Decision::RequireStepUp(StepUpReason::AmountExceeded)
+        } else if window.cumulative_amount + amount > policy.daily_velocity_cap {
+            Decision::RequireStepUp(StepUpReason::VelocityExceeded)
+        } else {
+            Decision::Allow
+        };
+
+        // Velocity accumulates regardless of the decision reached: a transfer
+        // that triggered step-up and was then completed by the user still
+        // happened, and must count toward the cap. Only counting Allow-ed
+        // transfers would let someone reset their effective velocity just by
+        // making every transfer trigger step-up.
+        window.cumulative_amount += amount;
+        window.tx_count += 1;
+        storage::write_velocity(&env, &wallet, &window);
+
+        match &decision {
+            Decision::Allow => {
+                EvaluationAllowedEvent {
+                    wallet: wallet.clone(),
+                    recipient: recipient.clone(),
+                    amount,
+                }
+                .publish(&env);
+            }
+            Decision::RequireStepUp(reason) => {
+                StepupRequiredEvent {
+                    wallet: wallet.clone(),
+                    recipient: recipient.clone(),
+                    amount,
+                    reason: reason.clone(),
+                }
+                .publish(&env);
+            }
+        }
+
+        Ok(decision)
     }
 }
 
