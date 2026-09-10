@@ -319,3 +319,30 @@ fn evaluate_velocity_accumulates_even_when_stepup_required() {
     assert_eq!(window.cumulative_amount, 2_000);
     assert_eq!(window.tx_count, 1);
 }
+
+#[test]
+fn evaluate_fails_when_no_policy() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let result = client.try_evaluate(&wallet, &recipient, &100);
+    assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
+}
+
+#[test]
+fn evaluate_fails_when_amount_not_positive() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false);
+
+    let zero_result = client.try_evaluate(&wallet, &recipient, &0);
+    assert_eq!(zero_result, Err(Ok(WardenError::InvalidAmount)));
+
+    let negative_result = client.try_evaluate(&wallet, &recipient, &-5);
+    assert_eq!(negative_result, Err(Ok(WardenError::InvalidAmount)));
+}
