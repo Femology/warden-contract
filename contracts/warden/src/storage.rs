@@ -1,6 +1,6 @@
 use soroban_sdk::{Address, Env};
 
-use crate::types::{DataKey, Policy};
+use crate::types::{DataKey, Policy, VelocityWindow};
 
 // Assumes an average ~5 second ledger close time.
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -15,6 +15,19 @@ pub fn read_policy(env: &Env, wallet: &Address) -> Option<Policy> {
 pub fn write_policy(env: &Env, wallet: &Address, policy: &Policy) {
     let key = DataKey::Policy(wallet.clone());
     env.storage().persistent().set(&key, policy);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn read_velocity(env: &Env, wallet: &Address) -> Option<VelocityWindow> {
+    let key = DataKey::Velocity(wallet.clone());
+    env.storage().persistent().get(&key)
+}
+
+pub fn write_velocity(env: &Env, wallet: &Address, velocity: &VelocityWindow) {
+    let key = DataKey::Velocity(wallet.clone());
+    env.storage().persistent().set(&key, velocity);
     env.storage()
         .persistent()
         .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
