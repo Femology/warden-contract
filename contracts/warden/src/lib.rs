@@ -14,6 +14,7 @@ pub use types::{
 
 const DAY_IN_LEDGERS: u32 = 17280;
 const SECONDS_PER_DAY: u64 = 86400;
+const SECONDS_PER_HOUR: u64 = 3600;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 60;
 
@@ -46,10 +47,18 @@ impl WardenContract {
         max_no_stepup: i128,
         daily_velocity_cap: i128,
         new_recipient_requires_stepup: bool,
+        hourly_velocity_cap: i128,
     ) -> Result<(), WardenError> {
         wallet.require_auth();
 
-        if max_no_stepup < 0 || daily_velocity_cap < max_no_stepup {
+        // hourly_velocity_cap must sit between 0 and daily_velocity_cap --
+        // allowing more per hour than per day would make the hourly window
+        // meaningless (the daily cap would never be the binding constraint).
+        if max_no_stepup < 0
+            || daily_velocity_cap < max_no_stepup
+            || hourly_velocity_cap < 0
+            || hourly_velocity_cap > daily_velocity_cap
+        {
             return Err(WardenError::InvalidPolicyParams);
         }
 
@@ -59,6 +68,7 @@ impl WardenContract {
             Some(mut existing) => {
                 existing.max_no_stepup = max_no_stepup;
                 existing.daily_velocity_cap = daily_velocity_cap;
+                existing.hourly_velocity_cap = hourly_velocity_cap;
                 existing.new_recipient_requires_stepup = new_recipient_requires_stepup;
                 existing.updated_at = now;
                 existing
@@ -67,6 +77,7 @@ impl WardenContract {
                 owner: wallet.clone(),
                 max_no_stepup,
                 daily_velocity_cap,
+                hourly_velocity_cap,
                 new_recipient_requires_stepup,
                 trusted_recipients: Vec::new(&env),
                 updated_at: now,
@@ -78,12 +89,14 @@ impl WardenContract {
         // Uses #[contractevent] (current API) rather than the deprecated
         // env.events().publish. data_format = "vec" on PolicySetEvent keeps the
         // on-chain wire shape positional: topics ("policy_set", wallet), data
-        // (max_no_stepup, daily_velocity_cap, new_recipient_requires_stepup),
-        // matching the exact shape warden-monitor's decoder is spec'd against.
+        // (max_no_stepup, daily_velocity_cap, hourly_velocity_cap,
+        // new_recipient_requires_stepup), matching the exact shape
+        // warden-monitor's decoder is spec'd against.
         PolicySetEvent {
             wallet,
             max_no_stepup,
             daily_velocity_cap,
+            hourly_velocity_cap,
             new_recipient_requires_stepup,
         }
         .publish(&env);
@@ -156,38 +169,62 @@ impl WardenContract {
         }
 
         let now = env.ledger().timestamp();
-        let mut window = storage::read_velocity(&env, &wallet).unwrap_or(VelocityWindow {
-            window_start: 0,
-            cumulative_amount: 0,
-            tx_count: 0,
-        });
 
-        if now - window.window_start >= SECONDS_PER_DAY {
-            window.window_start = now;
-            window.cumulative_amount = 0;
-            window.tx_count = 0;
+        let mut daily_window =
+            storage::read_daily_velocity(&env, &wallet).unwrap_or(VelocityWindow {
+                window_start: 0,
+                cumulative_amount: 0,
+                tx_count: 0,
+            });
+        if now - daily_window.window_start >= SECONDS_PER_DAY {
+            daily_window.window_start = now;
+            daily_window.cumulative_amount = 0;
+            daily_window.tx_count = 0;
         }
 
+        let mut hourly_window =
+            storage::read_hourly_velocity(&env, &wallet).unwrap_or(VelocityWindow {
+                window_start: 0,
+                cumulative_amount: 0,
+                tx_count: 0,
+            });
+        if now - hourly_window.window_start >= SECONDS_PER_HOUR {
+            hourly_window.window_start = now;
+            hourly_window.cumulative_amount = 0;
+            hourly_window.tx_count = 0;
+        }
+
+        // Order: new recipient, then amount, then hourly velocity, then
+        // daily velocity. When both windows are simultaneously exceeded,
+        // HourlyVelocityExceeded is reported -- it's the more specific,
+        // more immediately actionable signal ("you're moving too fast"
+        // rather than "you hit your day limit").
         let decision = if policy.new_recipient_requires_stepup
             && !policy.trusted_recipients.contains(&recipient)
         {
             Decision::RequireStepUp(StepUpReason::NewRecipient)
         } else if amount > policy.max_no_stepup {
             Decision::RequireStepUp(StepUpReason::AmountExceeded)
-        } else if window.cumulative_amount + amount > policy.daily_velocity_cap {
+        } else if hourly_window.cumulative_amount + amount > policy.hourly_velocity_cap {
+            Decision::RequireStepUp(StepUpReason::HourlyVelocityExceeded)
+        } else if daily_window.cumulative_amount + amount > policy.daily_velocity_cap {
             Decision::RequireStepUp(StepUpReason::VelocityExceeded)
         } else {
             Decision::Allow
         };
 
-        // Velocity accumulates regardless of the decision reached: a transfer
-        // that triggered step-up and was then completed by the user still
-        // happened, and must count toward the cap. Only counting Allow-ed
-        // transfers would let someone reset their effective velocity just by
-        // making every transfer trigger step-up.
-        window.cumulative_amount += amount;
-        window.tx_count += 1;
-        storage::write_velocity(&env, &wallet, &window);
+        // Both windows accumulate regardless of the decision reached: a
+        // transfer that triggered step-up and was then completed by the user
+        // still happened, and must count toward both caps. Only counting
+        // Allow-ed transfers would let someone reset their effective
+        // velocity just by making every transfer trigger step-up.
+        daily_window.cumulative_amount += amount;
+        daily_window.tx_count += 1;
+        storage::write_daily_velocity(&env, &wallet, &daily_window);
+
+        hourly_window.cumulative_amount += amount;
+        hourly_window.tx_count += 1;
+        storage::write_hourly_velocity(&env, &wallet, &hourly_window);
 
         match &decision {
             Decision::Allow => {
@@ -217,7 +254,7 @@ impl WardenContract {
     }
 
     pub fn get_velocity(env: Env, wallet: Address) -> Result<VelocityWindow, WardenError> {
-        let window = storage::read_velocity(&env, &wallet).unwrap_or(VelocityWindow {
+        let window = storage::read_daily_velocity(&env, &wallet).unwrap_or(VelocityWindow {
             window_start: 0,
             cumulative_amount: 0,
             tx_count: 0,

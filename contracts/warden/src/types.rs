@@ -16,6 +16,13 @@ pub struct Policy {
     pub owner: Address,
     pub max_no_stepup: i128,
     pub daily_velocity_cap: i128,
+    // A separate, smaller-scoped cap evaluated over a rolling-reset 1h
+    // window alongside the existing 24h one. Must be <= daily_velocity_cap
+    // (set_policy rejects otherwise) -- allowing more per hour than per day
+    // would make this cap meaningless. This is what catches rapid-fire
+    // spending that would otherwise only be caught once the full daily cap
+    // is reached, however long that takes.
+    pub hourly_velocity_cap: i128,
     pub new_recipient_requires_stepup: bool,
     pub trusted_recipients: Vec<Address>,
     pub updated_at: u64,
@@ -54,6 +61,7 @@ pub struct PolicySetEvent {
     pub wallet: Address,
     pub max_no_stepup: i128,
     pub daily_velocity_cap: i128,
+    pub hourly_velocity_cap: i128,
     pub new_recipient_requires_stepup: bool,
 }
 

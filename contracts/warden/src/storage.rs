@@ -20,13 +20,26 @@ pub fn write_policy(env: &Env, wallet: &Address, policy: &Policy) {
         .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
 
-pub fn read_velocity(env: &Env, wallet: &Address) -> Option<VelocityWindow> {
+pub fn read_daily_velocity(env: &Env, wallet: &Address) -> Option<VelocityWindow> {
     let key = DataKey::Velocity(wallet.clone());
     env.storage().persistent().get(&key)
 }
 
-pub fn write_velocity(env: &Env, wallet: &Address, velocity: &VelocityWindow) {
+pub fn write_daily_velocity(env: &Env, wallet: &Address, velocity: &VelocityWindow) {
     let key = DataKey::Velocity(wallet.clone());
+    env.storage().persistent().set(&key, velocity);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn read_hourly_velocity(env: &Env, wallet: &Address) -> Option<VelocityWindow> {
+    let key = DataKey::HourlyVelocity(wallet.clone());
+    env.storage().persistent().get(&key)
+}
+
+pub fn write_hourly_velocity(env: &Env, wallet: &Address, velocity: &VelocityWindow) {
+    let key = DataKey::HourlyVelocity(wallet.clone());
     env.storage().persistent().set(&key, velocity);
     env.storage()
         .persistent()
