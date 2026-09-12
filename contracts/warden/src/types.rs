@@ -8,6 +8,11 @@ pub enum DataKey {
     Policy(Address),
     Velocity(Address),
     HourlyVelocity(Address),
+    // Presence + `true` means flagged; absence means not flagged. Removing
+    // the key entirely on unflag (rather than writing `false`) keeps "is
+    // this address flagged" a plain storage lookup with no stale entries
+    // left behind for addresses that were flagged once and later cleared.
+    FlaggedAddress(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +61,7 @@ pub enum StepUpReason {
     NewRecipient,
     VelocityExceeded,
     HourlyVelocityExceeded,
+    FlaggedRecipient,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,4 +118,20 @@ pub struct StepupRequiredEvent {
     pub recipient: Address,
     pub amount: i128,
     pub reason: StepUpReason,
+}
+
+#[contractevent(topics = ["address_flagged"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressFlaggedEvent {
+    #[topic]
+    pub admin: Address,
+    pub address: Address,
+}
+
+#[contractevent(topics = ["address_unflagged"], data_format = "single-value")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddressUnflaggedEvent {
+    #[topic]
+    pub admin: Address,
+    pub address: Address,
 }
