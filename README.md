@@ -7,7 +7,7 @@ step-up confirmation, on-chain, at the wallet's own trust boundary.**
 
 [![CI](https://github.com/Femology/warden-contract/actions/workflows/ci.yml/badge.svg)](https://github.com/Femology/warden-contract/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Network](https://img.shields.io/badge/network-Stellar%20Testnet-7D00FF)](https://stellar.expert/explorer/testnet/contract/CBFQ752LFNC57U4KWDAEKNU43PLBWJ7M2B4ZRYUMCWL62JHJNUYJVMB5)
+[![Network](https://img.shields.io/badge/network-Stellar%20Testnet-7D00FF)](https://stellar.expert/explorer/testnet/contract/CD25U7GYDNB7XUBEEN3OKZK2LY62ANSUJJPQ6SF2Y6DHQ5SQ3F7LSVUF)
 
 [Warden org](https://github.com/Femology) · [warden-sdk](https://github.com/Femology/warden-sdk) · [warden-app](https://github.com/Femology/warden-app) · [warden-monitor](https://github.com/Femology/warden-monitor) · [Discussions](https://github.com/Femology/warden-contract/discussions)
 
@@ -218,25 +218,37 @@ in `warden-planning` for the full rationale. Two things changed:
    `trust_decay_seconds` no longer skips the new-recipient step-up, without needing to
    be explicitly removed and re-added.
 
-#### Migration note — this is a breaking storage schema change
+#### Migration note — this was a breaking storage schema change
 
 `Policy.trusted_recipients` changed type (`Vec<Address>` → `Map<Address, u64>`) and the
 struct gained two new fields (`hourly_velocity_cap`, `trust_decay_seconds`). Soroban
 contract storage decodes by the exact shape the currently-deployed wasm expects — **a
 policy stored under the pre-Phase-14 contract cannot be read by this version**, and
 there is no in-place upgrade path (this contract deliberately has no admin-upgrade
-function, by design — see Scope below).
+function, by design — see Scope below, and see the design discussion recorded in
+`warden-planning`'s `DEPLOYMENT-INFO.md` on why an immutable contract was chosen over
+an upgrade mechanism or a router/proxy pattern).
 
-Concretely: `warden-contract`'s v0.1.0 Testnet deployment
-(`CBFQ752LFNC57U4KWDAEKNU43PLBWJ7M2B4ZRYUMCWL62JHJNUYJVMB5`) already has real policy
-data under the old schema (from earlier testing). Deploying this Phase 14 code means a
-**new contract instance, a new contract ID** — not an upgrade of the existing one.
-Every wallet, including that Testnet one, needs to call `set_policy` again from
-scratch under the new deployment; nothing carries over automatically. This is
+**What actually happened:** the v0.1.0 Testnet contract
+(`CBFQ752LFNC57U4KWDAEKNU43PLBWJ7M2B4ZRYUMCWL62JHJNUYJVMB5`) — **deprecated, retired,
+do not use** — held real policy data under the old schema from earlier testing. Rather
+than an in-place upgrade (impossible, by design), Phase 14 was deployed as a genuinely
+new contract instance:
+
+| | |
+|---|---|
+| **Current contract ID** | [`CD25U7GYDNB7XUBEEN3OKZK2LY62ANSUJJPQ6SF2Y6DHQ5SQ3F7LSVUF`](https://stellar.expert/explorer/testnet/contract/CD25U7GYDNB7XUBEEN3OKZK2LY62ANSUJJPQ6SF2Y6DHQ5SQ3F7LSVUF) |
+| **Deprecated (v0.1.0, pre-Phase-14)** | `CBFQ752LFNC57U4KWDAEKNU43PLBWJ7M2B4ZRYUMCWL62JHJNUYJVMB5` — retired, holds only stale pre-Phase-14 data, not reachable from current code |
+
+The one wallet with real Testnet data called `set_policy` and `add_trusted_recipient`
+again from scratch against the new contract — a wallet-signed action, not an admin
+migration (`set_policy` requires the wallet's own `require_auth()`; nothing here or
+anywhere in this contract can set a policy on another address's behalf). This was
 acceptable for Testnet with no real funds at stake and no migration tooling built for
 v1 — it would not be acceptable for a Mainnet deployment with real user data, which is
-exactly the kind of gap a real migration tool or an upgrade mechanism would need to
-close before this contract is used for anything beyond Testnet.
+exactly the kind of gap a real migration tool or a deliberately-governed upgrade
+mechanism would need to close before this contract is used for anything beyond
+Testnet.
 
 ### Tech stack
 
