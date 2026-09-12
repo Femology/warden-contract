@@ -6,8 +6,10 @@ from a typo fix to a new test case to a real feature.
 ## Before you start
 
 Read `../00-WARDEN-MASTER-PRD.md` (in the parent Warden planning repo, if you have
-access) or this repo's own README for the project's non-negotiable rules. The short
-version, specific to this contract:
+access) or this repo's own README for the project's non-negotiable rules. Read
+[`WARDEN-PROTOCOL.md`](WARDEN-PROTOCOL.md) if your change touches `evaluate()`'s
+decision logic or `AccountState` at all — see the next section. The short version,
+specific to this contract:
 
 - **The allow/step-up decision lives here and only here.** A change that would let the
   SDK, app, or monitor make or override that decision is out of scope for this repo.
@@ -15,6 +17,25 @@ version, specific to this contract:
 - **No `unwrap()` outside `#[cfg(test)]`.** Every fallible path returns a typed
   `WardenError`.
 - **No placeholders or stubs.** Every commit should leave working, tested code.
+
+## Changing a protocol rule
+
+If your change touches **what triggers a state transition or a step-up reason** —
+adding or changing a `StepUpReason` or `AccountState` value, changing `evaluate()`'s
+check order, adding a new way `AccountState` can change, or changing what an error
+code means — the ordinary "open an issue first" step below is not optional and has a
+specific required shape. Open an issue using the [Protocol Rule Change
+template](.github/ISSUE_TEMPLATE/protocol-rule-change.md) and get it acknowledged by a
+maintainer *before* writing any code. See [`WARDEN-PROTOCOL.md`](WARDEN-PROTOCOL.md)'s
+own Governance section for exactly why and the full required sequence — in short:
+propose, get acknowledged, implement, update `WARDEN-PROTOCOL.md` in the same PR, add
+a `CHANGELOG.md` entry. This is what keeps the protocol reviewable by someone who
+didn't write it; skipping it for a rule change, however small, isn't a shortcut this
+repo accepts.
+
+A bug fix that makes the implementation match `WARDEN-PROTOCOL.md` more closely does
+**not** need this process — the document is ground truth, and conforming to it isn't a
+protocol change.
 
 ## Local setup
 

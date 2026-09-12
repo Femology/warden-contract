@@ -53,6 +53,13 @@ get_guardians, get_recovery_proposal      →  public reads, no auth
 Full function-by-function reference, the event table, and the stated v1 limitations
 (fixed, not sliding, velocity windows) are below in [Reference](#reference).
 
+**For a full specification of the protocol's rules — independent of Rust or Soroban,
+suitable for building a compatible oracle, an alternative wallet integration, or an
+alternative frontend without reading this repo's source — see
+[`WARDEN-PROTOCOL.md`](WARDEN-PROTOCOL.md).** Any change to what triggers a state
+transition or a step-up reason goes through the governance process documented there
+before it's implemented, not through an ordinary PR.
+
 ## Quickstart
 
 ```bash
