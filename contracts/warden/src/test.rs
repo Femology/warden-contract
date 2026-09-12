@@ -461,3 +461,29 @@ fn evaluate_requires_stepup_for_hourly_velocity_while_daily_has_headroom() {
     assert_eq!(daily.cumulative_amount, 600);
     assert!(daily.cumulative_amount < 10_000);
 }
+
+#[test]
+fn evaluate_recipient_decays_out_of_trust_after_configured_period() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // trust_decay_seconds = 100: short enough to advance past in a test.
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &100);
+    client.add_trusted_recipient(&wallet, &recipient);
+
+    // Immediately after trusting: still fresh, well within the decay
+    // window -> Allow.
+    let fresh = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(fresh, Decision::Allow);
+
+    // Advance past trust_decay_seconds without paying this recipient again.
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 101);
+
+    // Still in trusted_recipients (add/remove never touched it), but too
+    // long since last_paid_at -> treated the same as a brand-new recipient.
+    let decayed = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(decayed, Decision::RequireStepUp(StepUpReason::NewRecipient));
+}
