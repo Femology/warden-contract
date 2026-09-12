@@ -988,3 +988,82 @@ fn cancel_recovery_fails_when_nothing_is_pending() {
     let result = client.try_cancel_recovery(&wallet);
     assert_eq!(result, Err(Ok(WardenError::RecoveryNotFound)));
 }
+
+// --- Phase 16 getters: get_account_state, get_guardians, get_recovery_proposal --
+
+#[test]
+fn get_account_state_returns_normal_by_default() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    let state = client.get_account_state(&wallet);
+    assert_eq!(state, AccountState::Normal);
+}
+
+#[test]
+fn get_account_state_reflects_a_written_state() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Watch);
+    });
+
+    let state = client.get_account_state(&wallet);
+    assert_eq!(state, AccountState::Watch);
+}
+
+#[test]
+fn get_guardians_returns_configured_guardians_and_threshold() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    let config = client.get_guardians(&wallet);
+    assert_eq!(config.guardians.len(), 2);
+    assert!(config.guardians.contains(&g1));
+    assert!(config.guardians.contains(&g2));
+    assert_eq!(config.threshold, 2);
+}
+
+#[test]
+fn get_guardians_fails_when_never_configured() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    let result = client.try_get_guardians(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::GuardiansNotConfigured)));
+}
+
+#[test]
+fn get_recovery_proposal_returns_the_pending_proposal() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+    client.approve_recovery(&wallet, &g2);
+
+    let proposal = client.get_recovery_proposal(&wallet);
+    assert_eq!(proposal.proposer, g1);
+    assert_eq!(proposal.target_state, AccountState::Normal);
+    assert_eq!(proposal.approvals.len(), 2);
+    assert_eq!(proposal.timelock_seconds, 172_800);
+}
+
+#[test]
+fn get_recovery_proposal_fails_when_nothing_is_pending() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    let result = client.try_get_recovery_proposal(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::RecoveryNotFound)));
+}
