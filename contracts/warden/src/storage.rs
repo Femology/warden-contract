@@ -1,6 +1,8 @@
 use soroban_sdk::{Address, Env};
 
-use crate::types::{DataKey, Policy, VelocityWindow};
+use crate::types::{
+    AccountState, DataKey, GuardianConfig, Policy, RecoveryProposal, VelocityWindow,
+};
 
 // Assumes an average ~5 second ledger close time.
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -63,5 +65,50 @@ pub fn write_flagged_address(env: &Env, address: &Address) {
 
 pub fn remove_flagged_address(env: &Env, address: &Address) {
     let key = DataKey::FlaggedAddress(address.clone());
+    env.storage().persistent().remove(&key);
+}
+
+// Absence means AccountState::Normal.
+pub fn read_account_state(env: &Env, wallet: &Address) -> AccountState {
+    let key = DataKey::AccountState(wallet.clone());
+    env.storage().persistent().get(&key).unwrap_or(AccountState::Normal)
+}
+
+pub fn write_account_state(env: &Env, wallet: &Address, state: &AccountState) {
+    let key = DataKey::AccountState(wallet.clone());
+    env.storage().persistent().set(&key, state);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn read_guardian_config(env: &Env, wallet: &Address) -> Option<GuardianConfig> {
+    let key = DataKey::GuardianConfig(wallet.clone());
+    env.storage().persistent().get(&key)
+}
+
+pub fn write_guardian_config(env: &Env, wallet: &Address, config: &GuardianConfig) {
+    let key = DataKey::GuardianConfig(wallet.clone());
+    env.storage().persistent().set(&key, config);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn read_recovery_proposal(env: &Env, wallet: &Address) -> Option<RecoveryProposal> {
+    let key = DataKey::RecoveryProposal(wallet.clone());
+    env.storage().persistent().get(&key)
+}
+
+pub fn write_recovery_proposal(env: &Env, wallet: &Address, proposal: &RecoveryProposal) {
+    let key = DataKey::RecoveryProposal(wallet.clone());
+    env.storage().persistent().set(&key, proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn remove_recovery_proposal(env: &Env, wallet: &Address) {
+    let key = DataKey::RecoveryProposal(wallet.clone());
     env.storage().persistent().remove(&key);
 }

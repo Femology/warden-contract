@@ -4,13 +4,15 @@ mod errors;
 mod storage;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Map};
+use soroban_sdk::{contract, contractimpl, Address, Env, Map, Vec};
 
 pub use errors::WardenError;
 pub use types::{
-    AddressFlaggedEvent, AddressUnflaggedEvent, DataKey, Decision, EvaluationAllowedEvent, Policy,
-    PolicySetEvent, RecipientTrustedEvent, RecipientUntrustedEvent, StepUpReason,
-    StepupRequiredEvent, VelocityWindow,
+    AccountState, AddressFlaggedEvent, AddressUnflaggedEvent, DataKey, Decision,
+    EvaluationAllowedEvent, GuardianConfig, GuardiansSetEvent, Policy, PolicySetEvent,
+    RecipientTrustedEvent, RecipientUntrustedEvent, RecoveryApprovedEvent,
+    RecoveryCancelledEvent, RecoveryExecutedEvent, RecoveryProposal, RecoveryProposedEvent,
+    StepUpReason, StepupRequiredEvent, VelocityWindow,
 };
 
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -18,6 +20,19 @@ const SECONDS_PER_DAY: u64 = 86400;
 const SECONDS_PER_HOUR: u64 = 3600;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 60;
+
+const MAX_GUARDIANS: u32 = 7;
+// The roadmap spec's RecoveryProposal.timelock_seconds comment calls this
+// "configurable per wallet," but the given set_guardians signature (wallet,
+// guardians, threshold) has no parameter for it, and the given
+// propose_recovery signature (wallet, proposer, target_state) doesn't either
+// -- letting the *proposer* (a guardian) choose their own timelock at
+// proposal time would hand a colluding guardian control over the owner's
+// cancellation window, exactly the attack the timelock exists to prevent.
+// Fixed as a contract-wide constant, matching the spec's own example value,
+// until a real per-wallet configuration path is deliberately added (flagged
+// in the README as an open gap, not silently resolved either way).
+const RECOVERY_TIMELOCK_SECONDS: u64 = 172800; // 48 hours
 
 // Proves both identity (the caller really is `admin`, via require_auth) and
 // privilege (that address is the one stored at initialize) -- require_auth()
@@ -210,6 +225,171 @@ impl WardenContract {
         storage::remove_flagged_address(&env, &address);
 
         AddressUnflaggedEvent { admin, address }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn set_guardians(
+        env: Env,
+        wallet: Address,
+        guardians: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), WardenError> {
+        wallet.require_auth();
+
+        // Stops an attacker who just compromised a wallet from immediately
+        // adding their own colluding guardian before the owner notices --
+        // guardian config can only change while the account is still
+        // trustworthy enough to configure.
+        if storage::read_account_state(&env, &wallet) > AccountState::Watch {
+            return Err(WardenError::GuardianConfigLocked);
+        }
+
+        if guardians.len() > MAX_GUARDIANS || threshold == 0 || threshold > guardians.len() {
+            return Err(WardenError::InvalidGuardianConfig);
+        }
+
+        let config = GuardianConfig {
+            guardians: guardians.clone(),
+            threshold,
+        };
+        storage::write_guardian_config(&env, &wallet, &config);
+
+        GuardiansSetEvent {
+            wallet,
+            guardians,
+            threshold,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn propose_recovery(
+        env: Env,
+        wallet: Address,
+        proposer: Address,
+        target_state: AccountState,
+    ) -> Result<(), WardenError> {
+        proposer.require_auth();
+
+        let config =
+            storage::read_guardian_config(&env, &wallet).ok_or(WardenError::GuardiansNotConfigured)?;
+        if !config.guardians.contains(&proposer) {
+            return Err(WardenError::NotGuardian);
+        }
+
+        // One pending proposal at a time -- cancel_recovery or
+        // execute_recovery clears the slot before another can be proposed.
+        if storage::read_recovery_proposal(&env, &wallet).is_some() {
+            return Err(WardenError::RecoveryAlreadyProposed);
+        }
+
+        let current_state = storage::read_account_state(&env, &wallet);
+        if target_state >= current_state {
+            return Err(WardenError::InvalidTargetState);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut approvals = Vec::new(&env);
+        // The proposer's own approval counts immediately -- they don't have
+        // to call approve_recovery again for themselves.
+        approvals.push_back(proposer.clone());
+
+        let proposal = RecoveryProposal {
+            proposer: proposer.clone(),
+            target_state: target_state.clone(),
+            approvals,
+            proposed_at: now,
+            timelock_seconds: RECOVERY_TIMELOCK_SECONDS,
+        };
+        storage::write_recovery_proposal(&env, &wallet, &proposal);
+
+        RecoveryProposedEvent {
+            wallet,
+            proposer,
+            target_state,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn approve_recovery(env: Env, wallet: Address, guardian: Address) -> Result<(), WardenError> {
+        guardian.require_auth();
+
+        let config =
+            storage::read_guardian_config(&env, &wallet).ok_or(WardenError::GuardiansNotConfigured)?;
+        if !config.guardians.contains(&guardian) {
+            return Err(WardenError::NotGuardian);
+        }
+
+        let mut proposal =
+            storage::read_recovery_proposal(&env, &wallet).ok_or(WardenError::RecoveryNotFound)?;
+
+        if proposal.approvals.contains(&guardian) {
+            return Err(WardenError::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(guardian.clone());
+        let approvals_count = proposal.approvals.len();
+        storage::write_recovery_proposal(&env, &wallet, &proposal);
+
+        RecoveryApprovedEvent {
+            wallet,
+            guardian,
+            approvals_count,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn execute_recovery(env: Env, wallet: Address) -> Result<(), WardenError> {
+        // Deliberately no wallet.require_auth() anywhere in this function --
+        // this is the entire point of guardian recovery: routing around a
+        // compromised or unavailable owner key. Callable by anyone; only the
+        // stored approvals/timelock state gates it, never the caller's own
+        // identity.
+        let config =
+            storage::read_guardian_config(&env, &wallet).ok_or(WardenError::GuardiansNotConfigured)?;
+        let proposal =
+            storage::read_recovery_proposal(&env, &wallet).ok_or(WardenError::RecoveryNotFound)?;
+
+        if proposal.approvals.len() < config.threshold {
+            return Err(WardenError::InsufficientApprovals);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.proposed_at + proposal.timelock_seconds {
+            return Err(WardenError::TimelockNotElapsed);
+        }
+
+        storage::write_account_state(&env, &wallet, &proposal.target_state);
+        storage::remove_recovery_proposal(&env, &wallet);
+
+        RecoveryExecutedEvent {
+            wallet,
+            target_state: proposal.target_state,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn cancel_recovery(env: Env, wallet: Address) -> Result<(), WardenError> {
+        wallet.require_auth();
+
+        let proposal =
+            storage::read_recovery_proposal(&env, &wallet).ok_or(WardenError::RecoveryNotFound)?;
+        storage::remove_recovery_proposal(&env, &wallet);
+
+        RecoveryCancelledEvent {
+            wallet,
+            proposer: proposal.proposer,
+            target_state: proposal.target_state,
+        }
+        .publish(&env);
 
         Ok(())
     }
