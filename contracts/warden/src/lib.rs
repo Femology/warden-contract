@@ -8,8 +8,9 @@ use soroban_sdk::{contract, contractimpl, Address, Env, Map};
 
 pub use errors::WardenError;
 pub use types::{
-    DataKey, Decision, EvaluationAllowedEvent, Policy, PolicySetEvent, RecipientTrustedEvent,
-    RecipientUntrustedEvent, StepUpReason, StepupRequiredEvent, VelocityWindow,
+    AddressFlaggedEvent, AddressUnflaggedEvent, DataKey, Decision, EvaluationAllowedEvent, Policy,
+    PolicySetEvent, RecipientTrustedEvent, RecipientUntrustedEvent, StepUpReason,
+    StepupRequiredEvent, VelocityWindow,
 };
 
 const DAY_IN_LEDGERS: u32 = 17280;
@@ -17,6 +18,26 @@ const SECONDS_PER_DAY: u64 = 86400;
 const SECONDS_PER_HOUR: u64 = 3600;
 const INSTANCE_LIFETIME_THRESHOLD: u32 = DAY_IN_LEDGERS * 30;
 const INSTANCE_BUMP_AMOUNT: u32 = DAY_IN_LEDGERS * 60;
+
+// Proves both identity (the caller really is `admin`, via require_auth) and
+// privilege (that address is the one stored at initialize) -- require_auth()
+// alone only proves the former. Not a #[contractimpl] method: it's an
+// internal helper, not a contract entry point.
+fn require_admin(env: &Env, admin: &Address) -> Result<(), WardenError> {
+    admin.require_auth();
+
+    let stored_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(WardenError::NotInitialized)?;
+
+    if stored_admin != *admin {
+        return Err(WardenError::NotAdmin);
+    }
+
+    Ok(())
+}
 
 #[contract]
 pub struct WardenContract;
@@ -157,6 +178,42 @@ impl WardenContract {
         Ok(())
     }
 
+    pub fn add_flagged_address(
+        env: Env,
+        admin: Address,
+        address: Address,
+    ) -> Result<(), WardenError> {
+        require_admin(&env, &admin)?;
+
+        if storage::is_address_flagged(&env, &address) {
+            return Err(WardenError::AddressAlreadyFlagged);
+        }
+
+        storage::write_flagged_address(&env, &address);
+
+        AddressFlaggedEvent { admin, address }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn remove_flagged_address(
+        env: Env,
+        admin: Address,
+        address: Address,
+    ) -> Result<(), WardenError> {
+        require_admin(&env, &admin)?;
+
+        if !storage::is_address_flagged(&env, &address) {
+            return Err(WardenError::AddressNotFlagged);
+        }
+
+        storage::remove_flagged_address(&env, &address);
+
+        AddressUnflaggedEvent { admin, address }.publish(&env);
+
+        Ok(())
+    }
+
     pub fn evaluate(
         env: Env,
         wallet: Address,
@@ -207,12 +264,22 @@ impl WardenContract {
             None => false,
         };
 
-        // Order: new recipient, then amount, then hourly velocity, then
-        // daily velocity. When both windows are simultaneously exceeded,
-        // HourlyVelocityExceeded is reported -- it's the more specific,
-        // more immediately actionable signal ("you're moving too fast"
-        // rather than "you hit your day limit").
-        let decision = if policy.new_recipient_requires_stepup && !is_actively_trusted {
+        // Order: flagged recipient first, then new recipient, then amount,
+        // then hourly velocity, then daily velocity. Flagged wins over
+        // everything else -- a flagged address always needs step-up
+        // regardless of amount, trust, or velocity headroom, per the
+        // registry's whole purpose. This check runs after the policy is
+        // loaded (a wallet with no policy still gets PolicyNotFound, flagged
+        // recipient or not) but before any of the policy-dependent checks,
+        // and doesn't consult trusted_recipients/velocity at all -- a
+        // flagged address's own history with this wallet is irrelevant.
+        // When both windows are simultaneously exceeded, HourlyVelocityExceeded
+        // is reported -- it's the more specific, more immediately actionable
+        // signal ("you're moving too fast" rather than "you hit your day
+        // limit").
+        let decision = if storage::is_address_flagged(&env, &recipient) {
+            Decision::RequireStepUp(StepUpReason::FlaggedRecipient)
+        } else if policy.new_recipient_requires_stepup && !is_actively_trusted {
             Decision::RequireStepUp(StepUpReason::NewRecipient)
         } else if amount > policy.max_no_stepup {
             Decision::RequireStepUp(StepUpReason::AmountExceeded)

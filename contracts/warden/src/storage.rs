@@ -45,3 +45,23 @@ pub fn write_hourly_velocity(env: &Env, wallet: &Address, velocity: &VelocityWin
         .persistent()
         .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
 }
+
+// Absence means not flagged -- no separate "does this key exist" check
+// needed anywhere that calls this.
+pub fn is_address_flagged(env: &Env, address: &Address) -> bool {
+    let key = DataKey::FlaggedAddress(address.clone());
+    env.storage().persistent().get(&key).unwrap_or(false)
+}
+
+pub fn write_flagged_address(env: &Env, address: &Address) {
+    let key = DataKey::FlaggedAddress(address.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+pub fn remove_flagged_address(env: &Env, address: &Address) {
+    let key = DataKey::FlaggedAddress(address.clone());
+    env.storage().persistent().remove(&key);
+}
