@@ -23,10 +23,11 @@ their own rules — under this amount, to people I've paid before, just let it t
 so friction shows up where the risk actually is, not on every single tap.
 
 `warden-contract` is the one place that decision is made. It's a single-purpose Soroban
-contract: it stores per-wallet policy rules, tracks per-wallet spending velocity, and
-returns `Allow` or `RequireStepUp(reason)`. It never moves funds, never calls another
-contract, and never talks to anything off-chain — and nothing downstream (the SDK, the
-app, the monitoring dashboard) is permitted to make or override that decision.
+contract: it stores per-wallet policy rules, tracks per-wallet spending velocity, checks
+recipients against a small admin-managed flagged-address registry, and returns `Allow`
+or `RequireStepUp(reason)`. It never moves funds, never calls another contract, and
+never talks to anything off-chain — and nothing downstream (the SDK, the app, the
+monitoring dashboard) is permitted to make or override that decision.
 
 **Why Stellar specifically:** Soroban smart wallets support multiple signers with
 distinct roles evaluated inside the wallet's own `__check_auth`. That means this decision
@@ -37,7 +38,9 @@ backend service someone has to separately trust and operate.
 
 ```
 set_policy, add/remove_trusted_recipient  →  Policy(Address)     [persistent storage]
-evaluate(wallet, recipient, amount)       →  reads Policy + VelocityWindow(Address)
+add/remove_flagged_address (admin only)   →  FlaggedAddress(Address) -> bool
+evaluate(wallet, recipient, amount)       →  checks FlaggedAddress(recipient) first
+                                              → reads Policy + VelocityWindow(Address)
                                               → Decision::Allow | RequireStepUp(reason)
                                               → always updates VelocityWindow
 get_policy, get_velocity                  →  public reads, no auth
@@ -110,8 +113,14 @@ pub enum StepUpReason {
     NewRecipient,
     VelocityExceeded,
     HourlyVelocityExceeded,
+    FlaggedRecipient,
 }
 ```
+
+A recipient's flagged status is stored as a separate `FlaggedAddress(Address) -> bool`
+entry, one per address, not a field on `Policy` — it's a single global registry the
+admin manages, not something each wallet owner configures for themselves. See
+[Phase 15: flagged-address registry](#phase-15-flagged-address-registry) below.
 
 Two separate `VelocityWindow` values are tracked per wallet — one resetting every 24h
 (`daily_velocity_cap`), one resetting every 1h (`hourly_velocity_cap`) — the same shape,
@@ -145,6 +154,19 @@ time — fresh, not decayed. Emits `recipient_trusted`.
 Requires `wallet` auth and an existing policy. Fails with `RecipientNotTrusted` if the
 recipient isn't in the list. Emits `recipient_untrusted`.
 
+#### `add_flagged_address(admin: Address, address: Address)`
+Requires `admin` auth, **and** that address must be the one stored at `initialize` —
+`admin.require_auth()` alone only proves the caller really is that address, not that
+the address is privileged, so this additionally checks it against the stored admin
+(`NotAdmin` if it isn't a match, `NotInitialized` if no admin has been set yet at all).
+Fails with `AddressAlreadyFlagged` if already flagged. Emits `address_flagged`. See
+[Phase 15: flagged-address registry](#phase-15-flagged-address-registry) below for what
+actually populates this in v1.
+
+#### `remove_flagged_address(admin: Address, address: Address)`
+Same admin gate as above. Fails with `AddressNotFlagged` if the address isn't
+currently flagged. Emits `address_unflagged`.
+
 #### `evaluate(wallet: Address, recipient: Address, amount: i128) -> Decision`
 The core function, called at the moment a transfer is attempted. Requires `wallet` auth.
 
@@ -157,11 +179,12 @@ The core function, called at the moment a transfer is attempted. Requires `walle
    `trusted_recipients` **and** `now - last_paid_at <= trust_decay_seconds`. A recipient
    past that age is still in the list (unaffected by `add`/`remove_trusted_recipient`),
    it just no longer counts as trusted for this check.
-5. Decides, checking in this order and returning on first match: new/decayed-untrusted
-   recipient → step-up; amount over `max_no_stepup` → step-up; cumulative hourly spend
-   over `hourly_velocity_cap` → step-up; cumulative daily spend over
-   `daily_velocity_cap` → step-up; otherwise → allow. When both velocity windows are
-   exceeded at once, the hourly reason is reported — it's the more specific, more
+5. Decides, checking in this order and returning on first match: `recipient` flagged in
+   the global registry → step-up, **regardless of amount, trust, or velocity headroom**;
+   new/decayed-untrusted recipient → step-up; amount over `max_no_stepup` → step-up;
+   cumulative hourly spend over `hourly_velocity_cap` → step-up; cumulative daily spend
+   over `daily_velocity_cap` → step-up; otherwise → allow. When both velocity windows
+   are exceeded at once, the hourly reason is reported — it's the more specific, more
    immediately actionable signal.
 6. Updates **both** velocity windows regardless of the decision, and refreshes
    `last_paid_at` for an already-trusted recipient regardless of the decision — same
@@ -169,6 +192,12 @@ The core function, called at the moment a transfer is attempted. Requires `walle
    happened, and must count. This does not touch `updated_at`, which means "the owner
    changed their policy configuration," not "a payment happened."
 7. Emits `evaluation_allowed` or `stepup_required`.
+
+The flagged-address check is evaluated after the policy is loaded (a wallet with no
+policy still gets `PolicyNotFound`, flagged recipient or not) but ahead of every
+policy-dependent check — it doesn't consult `trusted_recipients` or either velocity
+window at all, since a flagged address's specific history with this wallet is beside
+the point.
 
 #### `get_policy(wallet: Address) -> Policy`
 Public read, no auth. `PolicyNotFound` if none is set. Policy data isn't secret — it's
@@ -186,6 +215,8 @@ read, not a missing-configuration error.
 | `policy_set` | `("policy_set", wallet)` | `(max_no_stepup, daily_velocity_cap, hourly_velocity_cap, new_recipient_requires_stepup, trust_decay_seconds)` |
 | `recipient_trusted` | `("recipient_trusted", wallet)` | `recipient` |
 | `recipient_untrusted` | `("recipient_untrusted", wallet)` | `recipient` |
+| `address_flagged` | `("address_flagged", admin)` | `address` |
+| `address_unflagged` | `("address_unflagged", admin)` | `address` |
 | `evaluation_allowed` | `("eval_allowed", wallet)` | `(recipient, amount)` |
 | `stepup_required` | `("stepup_req", wallet)` | `(recipient, amount, reason)` |
 
@@ -250,6 +281,42 @@ exactly the kind of gap a real migration tool or a deliberately-governed upgrade
 mechanism would need to close before this contract is used for anything beyond
 Testnet.
 
+### Phase 15: flagged-address registry
+
+Added after Phase 14. A single global registry of addresses the admin has flagged —
+`evaluate()` checks the recipient against it before any policy-dependent check, and a
+flagged recipient always returns `RequireStepUp(FlaggedRecipient)`, regardless of
+amount, trust status, or velocity headroom.
+
+#### What populates this registry in v1 — stated plainly
+
+**It starts empty, and nothing populates it automatically.** `add_flagged_address` and
+`remove_flagged_address` are manually called by the admin, one address at a time. There
+is no external sanctions list, scam-address feed, chain-analytics API, or any other
+automated data source wired up in v1 — this is infrastructure for a future real feed,
+not a working integration with one yet. If and when a real source is chosen (for
+example, a maintained list of addresses reported for fraud, or a chain-analytics
+provider's flagged-address API), that choice and the sync mechanism belong in this
+section, named honestly, when it actually exists.
+
+**This is not an AI system, anywhere.** Flagging is a manual admin action against a
+static on-chain list — there is no model making judgments about which addresses are
+risky, here or in any component this contract talks to. Nothing in this contract,
+`warden-sdk`, `warden-app`, or `warden-monitor` should ever be described as AI-driven
+fraud detection; doing so would misrepresent what this registry actually is.
+
+#### Why `admin`, not per-wallet
+
+Unlike `trusted_recipients` (each wallet's own list, managed by that wallet), the
+flagged-address registry is one shared list every wallet's `evaluate()` call checks
+against — a wallet owner has no say over whether an address they're sending to is
+flagged, by design. `admin.require_auth()` alone isn't sufficient to gate this: it
+proves the caller really is whichever address they claim to be, not that the address is
+privileged. `add_flagged_address`/`remove_flagged_address` additionally check the
+caller against the address stored at `initialize`, failing with `NotAdmin` if it
+doesn't match — the first genuinely privileged (non-self-authorizing) check in this
+contract.
+
 ### Tech stack
 
 - **soroban-sdk**: pinned to exact `26.1.0` (not a caret range, and not the `27.0.0-rc`
@@ -266,3 +333,12 @@ Testnet.
 This contract does not: move funds, call other contracts, support multiple assets,
 register itself as a smart-wallet signer, or let anyone but a wallet's own owner change
 that wallet's policy. Each of these was considered and deliberately left out of v1.
+
+The one exception is the flagged-address registry (Phase 15): a single admin address,
+set once at `initialize` and never changeable afterward (there is no
+`transfer_admin`-style function in v1), can flag or unflag any address, affecting
+every wallet's `evaluate()` calls against it. This is a deliberate, narrow, and
+disclosed exception to "only a wallet's own owner acts on that wallet" — it's the
+contract's one privileged, non-self-authorizing action, and it exists specifically so
+a known-bad address can be blocked network-wide without every individual wallet owner
+having to know about and separately flag it themselves.
