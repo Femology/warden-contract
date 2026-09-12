@@ -423,3 +423,34 @@ fn get_velocity_returns_zeroed_window_when_no_activity() {
     assert_eq!(window.cumulative_amount, 0);
     assert_eq!(window.tx_count, 0);
 }
+
+#[test]
+fn evaluate_requires_stepup_for_hourly_velocity_while_daily_has_headroom() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Daily cap is generous (10_000); hourly cap is tight (500). Neither
+    // transfer below is anywhere near the daily cap.
+    client.set_policy(&wallet, &1_000, &10_000, &false, &500);
+
+    let first = client.evaluate(&wallet, &recipient, &300);
+    assert_eq!(first, Decision::Allow);
+
+    // Cumulative is now 600 for both windows: 600 <= 10_000 (daily headroom
+    // untouched) but 600 > 500 (hourly cap exceeded). This is the case the
+    // hourly window exists for -- rapid spending a single daily cap alone
+    // would not catch until far more had been spent.
+    let second = client.evaluate(&wallet, &recipient, &300);
+    assert_eq!(
+        second,
+        Decision::RequireStepUp(StepUpReason::HourlyVelocityExceeded)
+    );
+
+    let daily = env
+        .as_contract(&_contract_id, || storage::read_daily_velocity(&env, &wallet))
+        .unwrap();
+    assert_eq!(daily.cumulative_amount, 600);
+    assert!(daily.cumulative_amount < 10_000);
+}
