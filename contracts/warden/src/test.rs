@@ -39,7 +39,7 @@ fn set_policy_creates_new_policy() {
     let (env, client, contract_id, _admin, _reference_asset) = setup();
 
     let wallet = Address::generate(&env);
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
 
     let policy = env
         .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
@@ -58,7 +58,7 @@ fn set_policy_rejects_hourly_velocity_cap_above_daily_cap() {
     let (env, client, _contract_id, _admin, _reference_asset) = setup();
 
     let wallet = Address::generate(&env);
-    let result = client.try_set_policy(&wallet, &1_000, &5_000, &true, &6_000);
+    let result = client.try_set_policy(&wallet, &1_000, &5_000, &true, &6_000, &999_999_999);
     assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
 }
 
@@ -69,7 +69,7 @@ fn set_policy_updates_existing_policy_without_touching_trusted_recipients() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
 
     // Seed a trusted recipient directly through the storage layer, since
     // add_trusted_recipient does not exist yet at this point in the build
@@ -77,11 +77,11 @@ fn set_policy_updates_existing_policy_without_touching_trusted_recipients() {
     // that set_policy leaves an existing trusted_recipients list untouched.
     env.as_contract(&contract_id, || {
         let mut policy = storage::read_policy(&env, &wallet).unwrap();
-        policy.trusted_recipients.push_back(recipient.clone());
+        policy.trusted_recipients.set(recipient.clone(), 42);
         storage::write_policy(&env, &wallet, &policy);
     });
 
-    client.set_policy(&wallet, &2_000, &9_000, &false, &9_000);
+    client.set_policy(&wallet, &2_000, &9_000, &false, &9_000, &999_999_999);
 
     let policy = env
         .as_contract(&contract_id, || storage::read_policy(&env, &wallet))
@@ -91,7 +91,7 @@ fn set_policy_updates_existing_policy_without_touching_trusted_recipients() {
     assert_eq!(policy.daily_velocity_cap, 9_000);
     assert!(!policy.new_recipient_requires_stepup);
     assert_eq!(policy.trusted_recipients.len(), 1);
-    assert_eq!(policy.trusted_recipients.get(0).unwrap(), recipient);
+    assert_eq!(policy.trusted_recipients.get(recipient).unwrap(), 42);
 }
 
 #[test]
@@ -99,7 +99,7 @@ fn set_policy_rejects_negative_max_no_stepup() {
     let (env, client, _contract_id, _admin, _reference_asset) = setup();
 
     let wallet = Address::generate(&env);
-    let result = client.try_set_policy(&wallet, &-1, &5_000, &true, &5_000);
+    let result = client.try_set_policy(&wallet, &-1, &5_000, &true, &5_000, &999_999_999);
     assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
 }
 
@@ -108,7 +108,7 @@ fn set_policy_rejects_velocity_cap_below_max_no_stepup() {
     let (env, client, _contract_id, _admin, _reference_asset) = setup();
 
     let wallet = Address::generate(&env);
-    let result = client.try_set_policy(&wallet, &5_000, &1_000, &true, &1_000);
+    let result = client.try_set_policy(&wallet, &5_000, &1_000, &true, &1_000, &999_999_999);
     assert_eq!(result, Err(Ok(WardenError::InvalidPolicyParams)));
 }
 
@@ -119,7 +119,9 @@ fn add_trusted_recipient_succeeds() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
+
+    let before = env.ledger().timestamp();
     client.add_trusted_recipient(&wallet, &recipient);
 
     let policy = env
@@ -127,7 +129,11 @@ fn add_trusted_recipient_succeeds() {
         .unwrap();
 
     assert_eq!(policy.trusted_recipients.len(), 1);
-    assert_eq!(policy.trusted_recipients.get(0).unwrap(), recipient);
+    assert_eq!(
+        policy.trusted_recipients.get(recipient).unwrap(),
+        before,
+        "last_paid_at should be set to the ledger time it was added"
+    );
 }
 
 #[test]
@@ -137,7 +143,7 @@ fn add_trusted_recipient_fails_when_already_trusted() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
     client.add_trusted_recipient(&wallet, &recipient);
 
     let result = client.try_add_trusted_recipient(&wallet, &recipient);
@@ -162,7 +168,7 @@ fn remove_trusted_recipient_succeeds() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
     client.add_trusted_recipient(&wallet, &recipient);
     client.remove_trusted_recipient(&wallet, &recipient);
 
@@ -180,7 +186,7 @@ fn remove_trusted_recipient_fails_when_not_trusted() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
 
     let result = client.try_remove_trusted_recipient(&wallet, &recipient);
     assert_eq!(result, Err(Ok(WardenError::RecipientNotTrusted)));
@@ -193,13 +199,14 @@ fn set_policy_emits_policy_set_event_with_exact_topic_and_data_shape() {
     let (env, client, contract_id, _admin, _reference_asset) = setup();
     let wallet = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000i128, &5_000i128, &true, &5_000i128);
+    client.set_policy(&wallet, &1_000i128, &5_000i128, &true, &5_000i128, &999_999_999);
 
     let mut data: soroban_sdk::Vec<Val> = soroban_sdk::Vec::new(&env);
     data.push_back(1_000i128.into_val(&env));
     data.push_back(5_000i128.into_val(&env));
     data.push_back(5_000i128.into_val(&env));
     data.push_back(true.into_val(&env));
+    data.push_back(999_999_999u64.into_val(&env));
 
     assert_eq!(
         env.events().all(),
@@ -221,7 +228,7 @@ fn evaluate_allows_when_under_thresholds() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
 
     let decision = client.evaluate(&wallet, &recipient, &500);
     assert_eq!(decision, Decision::Allow);
@@ -234,7 +241,7 @@ fn evaluate_requires_stepup_for_new_recipient() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
 
     let decision = client.evaluate(&wallet, &recipient, &500);
     assert_eq!(decision, Decision::RequireStepUp(StepUpReason::NewRecipient));
@@ -247,7 +254,7 @@ fn evaluate_requires_stepup_when_amount_exceeds_max() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
 
     let decision = client.evaluate(&wallet, &recipient, &1_500);
     assert_eq!(
@@ -263,7 +270,7 @@ fn evaluate_requires_stepup_when_velocity_cap_exceeded() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &1_500, &false, &1_500);
+    client.set_policy(&wallet, &1_000, &1_500, &false, &1_500, &999_999_999);
 
     // First transfer: under max_no_stepup and under the daily cap -> Allow.
     let start = env.ledger().timestamp();
@@ -294,7 +301,7 @@ fn evaluate_velocity_window_resets_after_24h() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &1_000, &false, &1_000);
+    client.set_policy(&wallet, &1_000, &1_000, &false, &1_000, &999_999_999);
 
     let start = env.ledger().timestamp();
 
@@ -329,7 +336,7 @@ fn evaluate_velocity_accumulates_even_when_stepup_required() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
 
     // This exceeds max_no_stepup, so it triggers step-up...
     let decision = client.evaluate(&wallet, &recipient, &2_000);
@@ -366,7 +373,7 @@ fn evaluate_fails_when_amount_not_positive() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
 
     let zero_result = client.try_evaluate(&wallet, &recipient, &0);
     assert_eq!(zero_result, Err(Ok(WardenError::InvalidAmount)));
@@ -380,7 +387,7 @@ fn get_policy_returns_configured_policy() {
     let (env, client, _contract_id, _admin, _reference_asset) = setup();
 
     let wallet = Address::generate(&env);
-    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &true, &5_000, &999_999_999);
 
     let policy = client.get_policy(&wallet);
     assert_eq!(policy.max_no_stepup, 1_000);
@@ -404,7 +411,7 @@ fn get_velocity_returns_recorded_window() {
     let wallet = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000);
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
     client.evaluate(&wallet, &recipient, &400);
 
     let window = client.get_velocity(&wallet);
@@ -433,7 +440,7 @@ fn evaluate_requires_stepup_for_hourly_velocity_while_daily_has_headroom() {
 
     // Daily cap is generous (10_000); hourly cap is tight (500). Neither
     // transfer below is anywhere near the daily cap.
-    client.set_policy(&wallet, &1_000, &10_000, &false, &500);
+    client.set_policy(&wallet, &1_000, &10_000, &false, &500, &999_999_999);
 
     let first = client.evaluate(&wallet, &recipient, &300);
     assert_eq!(first, Decision::Allow);

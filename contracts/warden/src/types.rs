@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Vec};
+use soroban_sdk::{contracttype, Address, Map};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -24,7 +24,20 @@ pub struct Policy {
     // is reached, however long that takes.
     pub hourly_velocity_cap: i128,
     pub new_recipient_requires_stepup: bool,
-    pub trusted_recipients: Vec<Address>,
+    // Address -> last_paid_at (ledger timestamp of the most recent transfer
+    // evaluate() saw to this recipient, or the timestamp it was added if
+    // never paid since). A Map, not a Vec<(Address, u64)>: this is accessed
+    // by key on every evaluate() call ("is this recipient in here, and
+    // when did they last get paid"), which is exactly Map's get/set/
+    // contains_key/remove access pattern -- a Vec of tuples would need a
+    // linear scan (first_index_of + manual field comparison) for the same
+    // lookup, with no benefit since insertion order is never used anywhere.
+    pub trusted_recipients: Map<Address, u64>,
+    // How long a recipient stays "trusted" for the new_recipient_requires_stepup
+    // check after their last_paid_at, in seconds. A recipient past this age
+    // still counts as being in the list (add/remove behave the same either
+    // way) but no longer skips the new-recipient step-up until paid again.
+    pub trust_decay_seconds: u64,
     pub updated_at: u64,
 }
 
@@ -63,6 +76,7 @@ pub struct PolicySetEvent {
     pub daily_velocity_cap: i128,
     pub hourly_velocity_cap: i128,
     pub new_recipient_requires_stepup: bool,
+    pub trust_decay_seconds: u64,
 }
 
 #[contractevent(topics = ["recipient_trusted"], data_format = "single-value")]

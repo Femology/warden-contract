@@ -4,7 +4,7 @@ mod errors;
 mod storage;
 mod types;
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, Address, Env, Map};
 
 pub use errors::WardenError;
 pub use types::{
@@ -48,6 +48,7 @@ impl WardenContract {
         daily_velocity_cap: i128,
         new_recipient_requires_stepup: bool,
         hourly_velocity_cap: i128,
+        trust_decay_seconds: u64,
     ) -> Result<(), WardenError> {
         wallet.require_auth();
 
@@ -70,6 +71,7 @@ impl WardenContract {
                 existing.daily_velocity_cap = daily_velocity_cap;
                 existing.hourly_velocity_cap = hourly_velocity_cap;
                 existing.new_recipient_requires_stepup = new_recipient_requires_stepup;
+                existing.trust_decay_seconds = trust_decay_seconds;
                 existing.updated_at = now;
                 existing
             }
@@ -79,7 +81,8 @@ impl WardenContract {
                 daily_velocity_cap,
                 hourly_velocity_cap,
                 new_recipient_requires_stepup,
-                trusted_recipients: Vec::new(&env),
+                trusted_recipients: Map::new(&env),
+                trust_decay_seconds,
                 updated_at: now,
             },
         };
@@ -90,14 +93,15 @@ impl WardenContract {
         // env.events().publish. data_format = "vec" on PolicySetEvent keeps the
         // on-chain wire shape positional: topics ("policy_set", wallet), data
         // (max_no_stepup, daily_velocity_cap, hourly_velocity_cap,
-        // new_recipient_requires_stepup), matching the exact shape
-        // warden-monitor's decoder is spec'd against.
+        // new_recipient_requires_stepup, trust_decay_seconds), matching the
+        // exact shape warden-monitor's decoder is spec'd against.
         PolicySetEvent {
             wallet,
             max_no_stepup,
             daily_velocity_cap,
             hourly_velocity_cap,
             new_recipient_requires_stepup,
+            trust_decay_seconds,
         }
         .publish(&env);
 
@@ -114,12 +118,15 @@ impl WardenContract {
         let mut policy =
             storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
 
-        if policy.trusted_recipients.contains(&recipient) {
+        if policy.trusted_recipients.contains_key(recipient.clone()) {
             return Err(WardenError::RecipientAlreadyTrusted);
         }
 
-        policy.trusted_recipients.push_back(recipient.clone());
-        policy.updated_at = env.ledger().timestamp();
+        let now = env.ledger().timestamp();
+        // last_paid_at starts at "now", not zero: trust begins fresh the
+        // moment it's granted, rather than immediately reading as decayed.
+        policy.trusted_recipients.set(recipient.clone(), now);
+        policy.updated_at = now;
 
         storage::write_policy(&env, &wallet, &policy);
 
@@ -138,12 +145,9 @@ impl WardenContract {
         let mut policy =
             storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
 
-        let index = policy
-            .trusted_recipients
-            .first_index_of(&recipient)
-            .ok_or(WardenError::RecipientNotTrusted)?;
-
-        policy.trusted_recipients.remove(index);
+        if policy.trusted_recipients.remove(recipient.clone()).is_none() {
+            return Err(WardenError::RecipientNotTrusted);
+        }
         policy.updated_at = env.ledger().timestamp();
 
         storage::write_policy(&env, &wallet, &policy);
@@ -161,7 +165,7 @@ impl WardenContract {
     ) -> Result<Decision, WardenError> {
         wallet.require_auth();
 
-        let policy =
+        let mut policy =
             storage::read_policy(&env, &wallet).ok_or(WardenError::PolicyNotFound)?;
 
         if amount <= 0 {
@@ -194,14 +198,21 @@ impl WardenContract {
             hourly_window.tx_count = 0;
         }
 
+        // A recipient counts as trusted only if they're in the map AND
+        // haven't gone longer than trust_decay_seconds since last_paid_at --
+        // still present in the list either way (add/remove don't care about
+        // decay), just no longer skipping the new-recipient check.
+        let is_actively_trusted = match policy.trusted_recipients.get(recipient.clone()) {
+            Some(last_paid_at) => now.saturating_sub(last_paid_at) <= policy.trust_decay_seconds,
+            None => false,
+        };
+
         // Order: new recipient, then amount, then hourly velocity, then
         // daily velocity. When both windows are simultaneously exceeded,
         // HourlyVelocityExceeded is reported -- it's the more specific,
         // more immediately actionable signal ("you're moving too fast"
         // rather than "you hit your day limit").
-        let decision = if policy.new_recipient_requires_stepup
-            && !policy.trusted_recipients.contains(&recipient)
-        {
+        let decision = if policy.new_recipient_requires_stepup && !is_actively_trusted {
             Decision::RequireStepUp(StepUpReason::NewRecipient)
         } else if amount > policy.max_no_stepup {
             Decision::RequireStepUp(StepUpReason::AmountExceeded)
@@ -225,6 +236,20 @@ impl WardenContract {
         hourly_window.cumulative_amount += amount;
         hourly_window.tx_count += 1;
         storage::write_hourly_velocity(&env, &wallet, &hourly_window);
+
+        // Refresh last_paid_at for an existing trusted recipient on every
+        // evaluate() call, regardless of the decision -- same reasoning as
+        // the velocity windows above: a transfer that happened (even one
+        // that required step-up) is real evidence this recipient is still
+        // actively being paid, and should reset their decay clock. This
+        // does NOT touch updated_at (that field means "the owner changed
+        // their policy configuration", not "a payment happened") and does
+        // NOT create an entry for a recipient who isn't already trusted --
+        // the only way to start trusting someone is add_trusted_recipient.
+        if policy.trusted_recipients.contains_key(recipient.clone()) {
+            policy.trusted_recipients.set(recipient.clone(), now);
+            storage::write_policy(&env, &wallet, &policy);
+        }
 
         match &decision {
             Decision::Allow => {
