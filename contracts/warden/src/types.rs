@@ -7,6 +7,7 @@ pub enum DataKey {
     ReferenceAsset,
     Policy(Address),
     Velocity(Address),
+    HourlyVelocity(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +35,7 @@ pub enum StepUpReason {
     AmountExceeded,
     NewRecipient,
     VelocityExceeded,
+    HourlyVelocityExceeded,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
