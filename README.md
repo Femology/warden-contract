@@ -39,6 +39,9 @@ backend service someone has to separately trust and operate.
 ```
 set_policy, add/remove_trusted_recipient  →  Policy(Address)     [persistent storage]
 add/remove_flagged_address (admin only)   →  FlaggedAddress(Address) -> bool
+set_guardians                             →  GuardianConfig(Address)
+propose/approve/cancel_recovery           →  RecoveryProposal(Address)
+execute_recovery (no auth at all)         →  AccountState(Address), clears proposal
 evaluate(wallet, recipient, amount)       →  checks FlaggedAddress(recipient) first
                                               → reads Policy + VelocityWindow(Address)
                                               → Decision::Allow | RequireStepUp(reason)
@@ -115,12 +118,44 @@ pub enum StepUpReason {
     HourlyVelocityExceeded,
     FlaggedRecipient,
 }
+
+pub enum AccountState {
+    Normal,
+    Watch,
+    Restricted,
+    Challenged,
+    Frozen,
+}
+
+pub struct GuardianConfig {
+    pub guardians: Vec<Address>, // max 7
+    pub threshold: u32,          // 1 <= threshold <= guardians.len()
+}
+
+pub struct RecoveryProposal {
+    pub proposer: Address,
+    pub target_state: AccountState,
+    pub approvals: Vec<Address>,
+    pub proposed_at: u64,
+    pub timelock_seconds: u64,
+}
 ```
 
 A recipient's flagged status is stored as a separate `FlaggedAddress(Address) -> bool`
 entry, one per address, not a field on `Policy` — it's a single global registry the
 admin manages, not something each wallet owner configures for themselves. See
 [Phase 15: flagged-address registry](#phase-15-flagged-address-registry) below.
+
+`AccountState`, `GuardianConfig`, and `RecoveryProposal` are each their own storage
+entry per wallet (`AccountState(Address)`, `GuardianConfig(Address)`,
+`RecoveryProposal(Address)`), not fields on `Policy` — account state and guardian
+recovery are a separate lifecycle concern from spending configuration, and guardians
+are deliberately unable to touch `Policy` at all. Variants of `AccountState` are
+ordered least to most restrictive (`Normal < Watch < Restricted < Challenged <
+Frozen`); this ordering is what `set_guardians`' state gate and
+`propose_recovery`'s "strictly less restrictive" check both compare against. See
+[Phase 16: guardian and recovery subsystem](#phase-16-guardian-and-recovery-subsystem)
+below.
 
 Two separate `VelocityWindow` values are tracked per wallet — one resetting every 24h
 (`daily_velocity_cap`), one resetting every 1h (`hourly_velocity_cap`) — the same shape,
@@ -166,6 +201,46 @@ actually populates this in v1.
 #### `remove_flagged_address(admin: Address, address: Address)`
 Same admin gate as above. Fails with `AddressNotFlagged` if the address isn't
 currently flagged. Emits `address_unflagged`.
+
+#### `set_guardians(wallet: Address, guardians: Vec<Address>, threshold: u32)`
+Requires `wallet` auth. Fails with `GuardianConfigLocked` if the account's current
+state is worse than `Watch` (i.e. `Restricted`, `Challenged`, or `Frozen`) — stops an
+attacker who just compromised a wallet from immediately adding their own colluding
+guardian before the owner notices. Fails with `InvalidGuardianConfig` if
+`guardians.len() > 7`, `threshold == 0`, or `threshold > guardians.len()`. Emits
+`guardians_set`. See
+[Phase 16: guardian and recovery subsystem](#phase-16-guardian-and-recovery-subsystem)
+below.
+
+#### `propose_recovery(wallet: Address, proposer: Address, target_state: AccountState)`
+Requires `proposer` auth. Fails with `GuardiansNotConfigured` if `set_guardians` was
+never called, `NotGuardian` if `proposer` isn't in the guardian list,
+`RecoveryAlreadyProposed` if one is already pending, `InvalidTargetState` if
+`target_state` isn't strictly less restrictive than the account's current state.
+Starts the timelock at the current ledger time and counts the proposer's own approval
+immediately — they don't call `approve_recovery` again for themselves. Emits
+`recovery_proposed`.
+
+#### `approve_recovery(wallet: Address, guardian: Address)`
+Requires `guardian` auth. Fails with `GuardiansNotConfigured`, `NotGuardian` if
+`guardian` isn't on the list, `RecoveryNotFound` if nothing is pending,
+`AlreadyApproved` if this guardian already approved the current proposal. Emits
+`recovery_approved`.
+
+#### `execute_recovery(wallet: Address)`
+**No auth requirement at all — not even the wallet's own.** This is the entire point
+of guardian recovery: routing around a compromised or unavailable owner key. Callable
+by anyone; only the stored state gates it. Fails with `GuardiansNotConfigured`,
+`RecoveryNotFound` if nothing is pending, `InsufficientApprovals` if
+`approvals.len() < threshold`, `TimelockNotElapsed` if
+`now < proposed_at + timelock_seconds`. On success, transitions the account to
+`target_state` and clears the proposal. Emits `recovery_executed`.
+
+#### `cancel_recovery(wallet: Address)`
+Requires `wallet` auth — the owner's veto, usable any time before `execute_recovery`
+succeeds, protecting against a guardian-majority collusion attack while the owner's
+own key is still fine. Fails with `RecoveryNotFound` if nothing is pending. Emits
+`recovery_cancelled`.
 
 #### `evaluate(wallet: Address, recipient: Address, amount: i128) -> Decision`
 The core function, called at the moment a transfer is attempted. Requires `wallet` auth.
@@ -217,6 +292,11 @@ read, not a missing-configuration error.
 | `recipient_untrusted` | `("recipient_untrusted", wallet)` | `recipient` |
 | `address_flagged` | `("address_flagged", admin)` | `address` |
 | `address_unflagged` | `("address_unflagged", admin)` | `address` |
+| `guardians_set` | `("guardians_set", wallet)` | `(guardians, threshold)` |
+| `recovery_proposed` | `("recovery_proposed", wallet)` | `(proposer, target_state)` |
+| `recovery_approved` | `("recovery_approved", wallet)` | `(guardian, approvals_count)` |
+| `recovery_executed` | `("recovery_executed", wallet)` | `target_state` |
+| `recovery_cancelled` | `("recovery_cancelled", wallet)` | `(proposer, target_state)` |
 | `evaluation_allowed` | `("eval_allowed", wallet)` | `(recipient, amount)` |
 | `stepup_required` | `("stepup_req", wallet)` | `(recipient, amount, reason)` |
 
@@ -317,6 +397,76 @@ caller against the address stored at `initialize`, failing with `NotAdmin` if it
 doesn't match — the first genuinely privileged (non-self-authorizing) check in this
 contract.
 
+### Phase 16: guardian and recovery subsystem
+
+Added after Phase 15. Lets a wallet owner name a set of guardians who can, together and
+only after a timelock, move the account back toward normal operation if the owner's own
+key is compromised or unavailable — without ever gaining any say over how the wallet
+actually behaves once recovered.
+
+#### Design decisions, stated explicitly
+
+- **Guardians can only be configured while the account is `Normal` or `Watch`** — not
+  `Restricted`, `Challenged`, or `Frozen`. Stops an attacker who just compromised a
+  wallet from immediately adding their own colluding guardian before the owner notices.
+- **`execute_recovery` does not require the wallet owner's own signature, or anyone
+  else's.** This is the entire point of guardians — routing around a compromised owner
+  key. Guardian threshold + elapsed timelock is sufficient; the function has no
+  `require_auth` call on any address at all.
+- **The owner can cancel a pending proposal at any time before it executes**, with
+  their own signature. Protects against guardian-majority collusion in the ordinary
+  case where the owner's key is fine and a recovery was proposed maliciously or in
+  error.
+- **Guardians can only ever move the account toward less restriction**, and only
+  through this proposal/approval/timelock path — never instantly, never by simple
+  majority alone, and never in the more-restrictive direction. (Nothing in this phase
+  moves an account *into* a more restrictive state at all — see the open gap below.)
+- **Guardians cannot touch `Policy` or `trusted_recipients` — full stop.** No function
+  in this phase accepts a spending-limit or trusted-recipient argument, and none of the
+  five new functions call `storage::write_policy` anywhere. Guardians recover access to
+  normal operation; they never gain the ability to configure how the wallet behaves
+  once recovered.
+
+#### An honest gap: nothing escalates state yet
+
+This phase builds the *recovery* half of a state machine — moving an account back
+toward `Normal` — but nothing in `warden-contract` today ever moves an account into
+`Watch`/`Restricted`/`Challenged`/`Frozen` in the first place. `AccountState` defaults
+to `Normal` for every wallet and nothing currently changes it upward. That escalation
+path is out of scope for this phase — the roadmap's own Phase 17 (an oracle layer) is
+where automatic escalation would come from, explicitly marked conditional and not
+started. Until that or some other escalation mechanism exists, this subsystem is real,
+tested infrastructure with no way to actually trigger it outside of a test directly
+seeding `AccountState` in storage (which is exactly how this phase's own tests do it).
+
+#### An honest gap: no public getters
+
+The roadmap's function list for this phase is `set_guardians`, `propose_recovery`,
+`approve_recovery`, `execute_recovery`, `cancel_recovery` — five state-changing
+functions, no reads. Built exactly as specified, which means **there is currently no
+way for `warden-sdk`, `warden-app`, or `warden-monitor` to read a wallet's
+`AccountState`, `GuardianConfig`, or pending `RecoveryProposal` via a contract call.**
+`get_policy`/`get_velocity` exist as public reads for Phase 8's data; nothing analogous
+was specified here. This is flagged deliberately, not fixed unasked: a
+Guardians/Recovery Center UI cannot be built against this contract as it stands today
+without either adding getters (a natural, small follow-up) or reconstructing state
+entirely from the event log. Confirm which before starting frontend work.
+
+#### An honest deviation: `timelock_seconds` is a constant, not a parameter
+
+`RecoveryProposal.timelock_seconds` exists as a field (per spec), but neither
+`set_guardians` nor `propose_recovery`'s given signature has a parameter to set it —
+the roadmap's own comment calls it "configurable per wallet" without saying through
+what function. Every proposal uses a fixed contract-wide constant,
+`RECOVERY_TIMELOCK_SECONDS = 172800` (48 hours, the roadmap's own example value).
+Deliberately not made a `propose_recovery` parameter: that would let the *proposer* — a
+guardian, potentially a colluding one — choose their own timelock, undermining the
+entire mechanism the timelock exists for (giving the owner a real window to notice and
+cancel). A real "configurable per wallet" implementation would need the value set by
+the owner (e.g., an added parameter on `set_guardians`), not the guardian proposing
+recovery. Not built here since it isn't part of the given function signatures — stated
+as a disclosed gap, not silently resolved either way.
+
 ### Tech stack
 
 - **soroban-sdk**: pinned to exact `26.1.0` (not a caret range, and not the `27.0.0-rc`
@@ -342,3 +492,16 @@ disclosed exception to "only a wallet's own owner acts on that wallet" — it's 
 contract's one privileged, non-self-authorizing action, and it exists specifically so
 a known-bad address can be blocked network-wide without every individual wallet owner
 having to know about and separately flag it themselves.
+
+Phase 16's guardians are a second, differently-shaped exception: a wallet owner opts
+into naming their own guardians (self-configured, unlike the admin above), and those
+guardians can — together, past a threshold, past a timelock — change that specific
+wallet's `AccountState` without the owner's signature. `execute_recovery` is the one
+function in this entire contract with no `require_auth` call on any address at all.
+What guardians categorically cannot do, by construction, not just by convention: read
+or write `Policy`, touch `trusted_recipients`, or affect any wallet other than the one
+that named them. See
+[Phase 16: guardian and recovery subsystem](#phase-16-guardian-and-recovery-subsystem)
+above for the full design, including two disclosed gaps (no escalation path yet, no
+public getters yet) that the next phase of work needs to resolve before a real UI can
+be built against this.
