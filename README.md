@@ -46,7 +46,8 @@ evaluate(wallet, recipient, amount)       →  checks FlaggedAddress(recipient) 
                                               → reads Policy + VelocityWindow(Address)
                                               → Decision::Allow | RequireStepUp(reason)
                                               → always updates VelocityWindow
-get_policy, get_velocity                  →  public reads, no auth
+get_policy, get_velocity, get_account_state,
+get_guardians, get_recovery_proposal      →  public reads, no auth
 ```
 
 Full function-by-function reference, the event table, and the stated v1 limitations
@@ -283,6 +284,29 @@ Public read, no auth. Unlike `get_policy`, this never errors on absence — a wa
 no activity yet gets back a zeroed window, since "no activity" is a normal state for a
 read, not a missing-configuration error.
 
+#### `get_account_state(wallet: Address) -> AccountState`
+Public read, no auth. Never errors on absence — every wallet has an `AccountState` even
+if `set_guardians` was never called or nothing else ever wrote one; absence means
+`Normal`, same reasoning as `get_velocity`'s zeroed-window default.
+
+#### `get_guardians(wallet: Address) -> GuardianConfig`
+Public read, no auth. Unlike `get_account_state`, this **does** error on absence
+(`GuardiansNotConfigured`) — "no guardians configured" and "an empty guardian list" are
+genuinely different states, and treating never-configured as a real absence matches how
+`propose_recovery`/`approve_recovery`/`execute_recovery` already report it.
+
+#### `get_recovery_proposal(wallet: Address) -> RecoveryProposal`
+Public read, no auth. Errors with `RecoveryNotFound` if nothing is pending — the same
+error `approve_recovery`/`execute_recovery`/`cancel_recovery` already use for the same
+condition, so every function that can report "is a recovery in progress" agrees.
+
+These three were added after the rest of Phase 16 landed — the original spec listed
+five state-changing functions and no reads at all, which meant no way for `warden-sdk`,
+`warden-app`, or `warden-monitor` to read a wallet's guardian configuration or recovery
+status via a contract call. Same pattern as `get_policy`/`get_velocity`: a public,
+no-auth read per piece of state, since none of this is secret and everything on a
+public ledger is inspectable regardless.
+
 ### Events
 
 | Event | Topics | Data |
@@ -439,18 +463,18 @@ started. Until that or some other escalation mechanism exists, this subsystem is
 tested infrastructure with no way to actually trigger it outside of a test directly
 seeding `AccountState` in storage (which is exactly how this phase's own tests do it).
 
-#### An honest gap: no public getters
+#### Resolved gap: getters added after the rest of this phase landed
 
-The roadmap's function list for this phase is `set_guardians`, `propose_recovery`,
+The roadmap's function list for this phase was `set_guardians`, `propose_recovery`,
 `approve_recovery`, `execute_recovery`, `cancel_recovery` — five state-changing
-functions, no reads. Built exactly as specified, which means **there is currently no
-way for `warden-sdk`, `warden-app`, or `warden-monitor` to read a wallet's
-`AccountState`, `GuardianConfig`, or pending `RecoveryProposal` via a contract call.**
-`get_policy`/`get_velocity` exist as public reads for Phase 8's data; nothing analogous
-was specified here. This is flagged deliberately, not fixed unasked: a
-Guardians/Recovery Center UI cannot be built against this contract as it stands today
-without either adding getters (a natural, small follow-up) or reconstructing state
-entirely from the event log. Confirm which before starting frontend work.
+functions, no reads, which meant no way for `warden-sdk`, `warden-app`, or
+`warden-monitor` to read a wallet's `AccountState`, `GuardianConfig`, or pending
+`RecoveryProposal` via a contract call. Flagged here rather than silently fixed when
+first noticed; `get_account_state`, `get_guardians`, and `get_recovery_proposal` were
+added as a direct follow-up, matching `get_policy`/`get_velocity`'s existing pattern —
+see [Public functions](#public-functions) above for their exact semantics (in
+particular, `get_account_state` never errors on absence while `get_guardians` and
+`get_recovery_proposal` do, for reasons specific to each).
 
 #### An honest deviation: `timelock_seconds` is a constant, not a parameter
 
