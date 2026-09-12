@@ -1,8 +1,11 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, Env};
+use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, Env, Vec};
 
-use crate::{storage, Decision, StepUpReason, WardenContract, WardenContractClient, WardenError};
+use crate::{
+    storage, AccountState, Decision, StepUpReason, WardenContract, WardenContractClient,
+    WardenError,
+};
 
 fn setup<'a>() -> (Env, WardenContractClient<'a>, Address, Address, Address) {
     let env = Env::default();
@@ -634,4 +637,354 @@ fn evaluate_still_fails_with_policy_not_found_for_a_flagged_recipient() {
 
     let result = client.try_evaluate(&wallet, &recipient, &10);
     assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
+}
+
+fn addr_vec(env: &Env, addrs: &[&Address]) -> Vec<Address> {
+    let mut v = Vec::new(env);
+    for a in addrs {
+        v.push_back((*a).clone());
+    }
+    v
+}
+
+// --- Phase 16: guardian and recovery subsystem -----------------------------
+
+#[test]
+fn set_guardians_fails_while_restricted_or_worse() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let guardian = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+
+    let guardians = addr_vec(&env, &[&guardian]);
+    let result = client.try_set_guardians(&wallet, &guardians, &1u32);
+    assert_eq!(result, Err(Ok(WardenError::GuardianConfigLocked)));
+
+    // Worse than Restricted fails the same way.
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Frozen);
+    });
+    let result = client.try_set_guardians(&wallet, &guardians, &1u32);
+    assert_eq!(result, Err(Ok(WardenError::GuardianConfigLocked)));
+}
+
+#[test]
+fn set_guardians_succeeds_while_normal_or_watch() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let guardians = addr_vec(&env, &[&g1, &g2]);
+
+    // Default state is Normal -- no seeding needed.
+    client.set_guardians(&wallet, &guardians, &2u32);
+
+    let config = env
+        .as_contract(&contract_id, || storage::read_guardian_config(&env, &wallet))
+        .expect("guardian config should exist");
+    assert_eq!(config.guardians.len(), 2);
+    assert_eq!(config.threshold, 2);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Watch);
+    });
+    client.set_guardians(&wallet, &guardians, &1u32);
+}
+
+#[test]
+fn set_guardians_rejects_invalid_configs() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    let mut too_many = Vec::new(&env);
+    for _ in 0..8 {
+        too_many.push_back(Address::generate(&env));
+    }
+    assert_eq!(
+        client.try_set_guardians(&wallet, &too_many, &1u32),
+        Err(Ok(WardenError::InvalidGuardianConfig))
+    );
+
+    let three = addr_vec(
+        &env,
+        &[
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &Address::generate(&env),
+        ],
+    );
+    assert_eq!(
+        client.try_set_guardians(&wallet, &three, &0u32),
+        Err(Ok(WardenError::InvalidGuardianConfig))
+    );
+    assert_eq!(
+        client.try_set_guardians(&wallet, &three, &4u32),
+        Err(Ok(WardenError::InvalidGuardianConfig))
+    );
+}
+
+#[test]
+fn propose_recovery_creates_a_proposal_counting_the_proposers_own_approval() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    // Simulates the account having been restricted by some earlier event
+    // (an admin flag, or -- once built -- an oracle escalation). There's no
+    // public function that escalates state yet, so this is seeded directly,
+    // the same way other tests seed preconditions the public API can't
+    // reach on its own.
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+
+    let proposal = env
+        .as_contract(&contract_id, || storage::read_recovery_proposal(&env, &wallet))
+        .expect("proposal should exist");
+    assert_eq!(proposal.proposer, g1);
+    assert_eq!(proposal.target_state, AccountState::Normal);
+    assert_eq!(proposal.approvals.len(), 1);
+    assert!(proposal.approvals.contains(&g1));
+}
+
+#[test]
+fn propose_recovery_fails_for_a_non_guardian() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&guardian]), &1u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+
+    let result = client.try_propose_recovery(&wallet, &outsider, &AccountState::Normal);
+    assert_eq!(result, Err(Ok(WardenError::NotGuardian)));
+}
+
+#[test]
+fn propose_recovery_fails_when_target_state_is_not_less_restrictive() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&guardian]), &1u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Watch);
+    });
+
+    // Same state as current -- not strictly less restrictive.
+    let same = client.try_propose_recovery(&wallet, &guardian, &AccountState::Watch);
+    assert_eq!(same, Err(Ok(WardenError::InvalidTargetState)));
+
+    // More restrictive than current -- guardians can only ever move toward
+    // less restriction, never more.
+    let worse = client.try_propose_recovery(&wallet, &guardian, &AccountState::Frozen);
+    assert_eq!(worse, Err(Ok(WardenError::InvalidTargetState)));
+}
+
+#[test]
+fn propose_recovery_fails_when_one_is_already_pending() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+
+    let result = client.try_propose_recovery(&wallet, &g2, &AccountState::Watch);
+    assert_eq!(result, Err(Ok(WardenError::RecoveryAlreadyProposed)));
+}
+
+#[test]
+fn approve_recovery_fails_for_a_non_guardian() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&guardian]), &1u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &guardian, &AccountState::Normal);
+
+    let result = client.try_approve_recovery(&wallet, &outsider);
+    assert_eq!(result, Err(Ok(WardenError::NotGuardian)));
+}
+
+#[test]
+fn approve_recovery_fails_when_the_same_guardian_approves_twice() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    // g1's own approval is already counted by propose_recovery.
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+
+    let result = client.try_approve_recovery(&wallet, &g1);
+    assert_eq!(result, Err(Ok(WardenError::AlreadyApproved)));
+}
+
+#[test]
+fn execute_recovery_fails_with_insufficient_approvals() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    let g3 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2, &g3]), &3u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+    client.approve_recovery(&wallet, &g2);
+    // Only 2 of the required 3 approvals.
+
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 172_801);
+
+    let result = client.try_execute_recovery(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::InsufficientApprovals)));
+}
+
+#[test]
+fn execute_recovery_fails_before_timelock_elapses() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+    client.approve_recovery(&wallet, &g2);
+    // Threshold (2) is met, but no time has passed -- the 48h timelock
+    // hasn't elapsed yet.
+
+    let result = client.try_execute_recovery(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::TimelockNotElapsed)));
+}
+
+#[test]
+fn execute_recovery_succeeds_without_wallet_signature_once_threshold_and_timelock_are_met() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+    client.approve_recovery(&wallet, &g2);
+
+    let proposed_at = env.ledger().timestamp();
+    env.ledger().set_timestamp(proposed_at + 172_801);
+
+    // The whole point of this test: mock_auths(&[]) authorizes *nothing* for
+    // this one call, overriding setup()'s blanket mock_all_auths() for just
+    // this invocation. If execute_recovery called wallet.require_auth() (or
+    // any require_auth at all, on any address), this would panic on a
+    // missing authorization instead of succeeding -- so a passing test here
+    // is real proof no signature was required, not just an assumption from
+    // reading the source.
+    client.mock_auths(&[]).execute_recovery(&wallet);
+
+    let state = env.as_contract(&contract_id, || storage::read_account_state(&env, &wallet));
+    assert_eq!(state, AccountState::Normal);
+
+    let proposal = env.as_contract(&contract_id, || storage::read_recovery_proposal(&env, &wallet));
+    assert!(proposal.is_none());
+}
+
+#[test]
+fn execute_recovery_fails_when_no_proposal_is_pending() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let guardian = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&guardian]), &1u32);
+
+    let result = client.try_execute_recovery(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::RecoveryNotFound)));
+}
+
+#[test]
+fn cancel_recovery_lets_the_owner_cancel_a_pending_proposal_with_their_own_signature() {
+    let (env, client, contract_id, _admin, _reference_asset) = setup();
+
+    let wallet = Address::generate(&env);
+    let g1 = Address::generate(&env);
+    let g2 = Address::generate(&env);
+    client.set_guardians(&wallet, &addr_vec(&env, &[&g1, &g2]), &2u32);
+
+    env.as_contract(&contract_id, || {
+        storage::write_account_state(&env, &wallet, &AccountState::Restricted);
+    });
+    client.propose_recovery(&wallet, &g1, &AccountState::Normal);
+    client.approve_recovery(&wallet, &g2);
+
+    // The owner vetoes it -- protects against a guardian-majority collusion
+    // attack while the owner's own key is still fine. Uses the real client
+    // call (under setup()'s mock_all_auths()), which specifically means
+    // wallet.require_auth() succeeded -- this is the owner's own signature,
+    // not anyone else's.
+    client.cancel_recovery(&wallet);
+
+    let proposal = env.as_contract(&contract_id, || storage::read_recovery_proposal(&env, &wallet));
+    assert!(proposal.is_none());
+
+    // Threshold and timelock no longer matter -- there's nothing left to
+    // execute.
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 172_801);
+    let result = client.try_execute_recovery(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::RecoveryNotFound)));
+
+    // The account state was never actually changed by the vetoed proposal.
+    let state = env.as_contract(&contract_id, || storage::read_account_state(&env, &wallet));
+    assert_eq!(state, AccountState::Restricted);
+}
+
+#[test]
+fn cancel_recovery_fails_when_nothing_is_pending() {
+    let (env, client, _contract_id, _admin, _reference_asset) = setup();
+    let wallet = Address::generate(&env);
+
+    let result = client.try_cancel_recovery(&wallet);
+    assert_eq!(result, Err(Ok(WardenError::RecoveryNotFound)));
 }
