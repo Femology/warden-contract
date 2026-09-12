@@ -7,7 +7,7 @@ step-up confirmation, on-chain, at the wallet's own trust boundary.**
 
 [![CI](https://github.com/Femology/warden-contract/actions/workflows/ci.yml/badge.svg)](https://github.com/Femology/warden-contract/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Network](https://img.shields.io/badge/network-Stellar%20Testnet-7D00FF)](https://stellar.expert/explorer/testnet/contract/CD25U7GYDNB7XUBEEN3OKZK2LY62ANSUJJPQ6SF2Y6DHQ5SQ3F7LSVUF)
+[![Network](https://img.shields.io/badge/network-Stellar%20Testnet-7D00FF)](https://stellar.expert/explorer/testnet/contract/CD5QU2E6LOKFAZFESIZSAA4IENH5SZHJVU4Y6532WNZSXPZDYRKEEVUW)
 
 [Warden org](https://github.com/Femology) · [warden-sdk](https://github.com/Femology/warden-sdk) · [warden-app](https://github.com/Femology/warden-app) · [warden-monitor](https://github.com/Femology/warden-monitor) · [Discussions](https://github.com/Femology/warden-contract/discussions)
 
@@ -382,6 +382,39 @@ anywhere in this contract can set a policy on another address's behalf). This wa
 acceptable for Testnet with no real funds at stake and no migration tooling built for
 v1 — it would not be acceptable for a Mainnet deployment with real user data, which is
 exactly the kind of gap a real migration tool or a deliberately-governed upgrade
+mechanism would need to close before this contract is used for anything beyond
+Testnet.
+
+#### Second redeploy — Phases 15 and 16, batched together
+
+Unlike the Phase 14 redeploy above, this one is **not** a storage-shape break: Phase
+15's flagged-address registry and Phase 16's guardian/recovery subsystem both added
+new, independent storage keys (`FlaggedAddress`, `AccountState`, `GuardianConfig`,
+`RecoveryProposal`) without touching `Policy`'s existing shape at all. A wallet's
+existing `Policy` data would decode identically either way. The redeploy happened
+anyway for a different, unavoidable reason: this contract has no admin-upgrade
+function by design (see Scope below), so new wasm — new functions, period — can only
+ever mean a new contract instance. There's no way to add `set_guardians` to an
+already-deployed, immutable contract in place.
+
+| | |
+|---|---|
+| **Current contract ID** | [`CD5QU2E6LOKFAZFESIZSAA4IENH5SZHJVU4Y6532WNZSXPZDYRKEEVUW`](https://stellar.expert/explorer/testnet/contract/CD5QU2E6LOKFAZFESIZSAA4IENH5SZHJVU4Y6532WNZSXPZDYRKEEVUW) |
+| **Deprecated (Phase 14 only)** | `CD25U7GYDNB7XUBEEN3OKZK2LY62ANSUJJPQ6SF2Y6DHQ5SQ3F7LSVUF` — retired, has no flagged-address registry or guardian/recovery functions |
+
+Same pattern as before: the one real Testnet wallet re-ran `set_policy` and
+`add_trusted_recipient` against the new contract ID (verified live: `get_policy`
+correctly returns null before, the configured policy after, `evaluate()` returns
+`Allow` for a normal transfer, `RequireStepUp(FlaggedRecipient)` immediately after
+`add_flagged_address` on that same recipient and back to `Allow` after
+`remove_flagged_address` — not just simulated locally, actually submitted against
+Testnet). `get_account_state` and `get_guardians` were also checked live against a
+never-configured wallet, returning `Normal` and `GuardiansNotConfigured` respectively,
+exactly as the unit tests predict.
+
+This contract also has no migration tooling built for v1, for the same reason stated
+above — it would not be acceptable for a Mainnet deployment with real user data, which
+is exactly the kind of gap a real migration tool or a deliberately-governed upgrade
 mechanism would need to close before this contract is used for anything beyond
 Testnet.
 
