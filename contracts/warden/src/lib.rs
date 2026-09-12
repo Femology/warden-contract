@@ -533,6 +533,33 @@ impl WardenContract {
         });
         Ok(window)
     }
+
+    /// Public read, no auth. Never errors on absence -- every wallet has an
+    /// AccountState even if it never called set_guardians or had one
+    /// written any other way; absence means Normal, same reasoning as
+    /// get_velocity's zeroed-window default.
+    pub fn get_account_state(env: Env, wallet: Address) -> Result<AccountState, WardenError> {
+        Ok(storage::read_account_state(&env, &wallet))
+    }
+
+    /// Public read, no auth. Unlike get_account_state, this does error on
+    /// absence (GuardiansNotConfigured) -- unlike account state, which
+    /// every wallet conceptually has a value for, "no guardians" and "an
+    /// empty guardian list" are genuinely different states, and treating
+    /// never-configured as a real absence matches how propose_recovery/
+    /// approve_recovery/execute_recovery already report it.
+    pub fn get_guardians(env: Env, wallet: Address) -> Result<GuardianConfig, WardenError> {
+        storage::read_guardian_config(&env, &wallet).ok_or(WardenError::GuardiansNotConfigured)
+    }
+
+    /// Public read, no auth. Errors with RecoveryNotFound if nothing is
+    /// pending -- same error approve_recovery/execute_recovery/
+    /// cancel_recovery already use for the same condition, so callers
+    /// checking "is a recovery in progress" get one consistent answer
+    /// across every function that can report it.
+    pub fn get_recovery_proposal(env: Env, wallet: Address) -> Result<RecoveryProposal, WardenError> {
+        storage::read_recovery_proposal(&env, &wallet).ok_or(WardenError::RecoveryNotFound)
+    }
 }
 
 #[cfg(test)]
