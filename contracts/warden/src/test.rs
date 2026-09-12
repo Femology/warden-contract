@@ -487,3 +487,151 @@ fn evaluate_recipient_decays_out_of_trust_after_configured_period() {
     let decayed = client.evaluate(&wallet, &recipient, &10);
     assert_eq!(decayed, Decision::RequireStepUp(StepUpReason::NewRecipient));
 }
+
+#[test]
+fn add_flagged_address_succeeds_for_the_real_admin() {
+    let (env, client, contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let flagged = Address::generate(&env);
+    client.add_flagged_address(&admin, &flagged);
+
+    let is_flagged = env.as_contract(&contract_id, || storage::is_address_flagged(&env, &flagged));
+    assert!(is_flagged);
+}
+
+#[test]
+fn add_flagged_address_fails_for_a_non_admin_address() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    // mock_all_auths() makes every address's require_auth() succeed --
+    // proving this fails only if the contract itself checks the caller
+    // against the stored admin, not just that *someone* authorized the call.
+    let impostor = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    let result = client.try_add_flagged_address(&impostor, &target);
+    assert_eq!(result, Err(Ok(WardenError::NotAdmin)));
+}
+
+#[test]
+fn remove_flagged_address_fails_for_a_non_admin_address() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let target = Address::generate(&env);
+    client.add_flagged_address(&admin, &target);
+
+    let impostor = Address::generate(&env);
+    let result = client.try_remove_flagged_address(&impostor, &target);
+    assert_eq!(result, Err(Ok(WardenError::NotAdmin)));
+}
+
+#[test]
+fn flagged_address_functions_fail_before_initialize() {
+    let (env, client, _contract_id, admin, _reference_asset) = setup();
+
+    let target = Address::generate(&env);
+    let result = client.try_add_flagged_address(&admin, &target);
+    assert_eq!(result, Err(Ok(WardenError::NotInitialized)));
+}
+
+#[test]
+fn add_flagged_address_fails_when_already_flagged() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let target = Address::generate(&env);
+    client.add_flagged_address(&admin, &target);
+
+    let result = client.try_add_flagged_address(&admin, &target);
+    assert_eq!(result, Err(Ok(WardenError::AddressAlreadyFlagged)));
+}
+
+#[test]
+fn remove_flagged_address_succeeds_and_clears_the_flag() {
+    let (env, client, contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let target = Address::generate(&env);
+    client.add_flagged_address(&admin, &target);
+    client.remove_flagged_address(&admin, &target);
+
+    let is_flagged = env.as_contract(&contract_id, || storage::is_address_flagged(&env, &target));
+    assert!(!is_flagged);
+}
+
+#[test]
+fn remove_flagged_address_fails_when_not_flagged() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let target = Address::generate(&env);
+    let result = client.try_remove_flagged_address(&admin, &target);
+    assert_eq!(result, Err(Ok(WardenError::AddressNotFlagged)));
+}
+
+#[test]
+fn evaluate_requires_stepup_for_a_flagged_recipient_regardless_of_amount_trust_or_velocity() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Trusted, small amount, well inside every velocity cap -- every other
+    // signal says Allow. new_recipient_requires_stepup is even off.
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
+    client.add_trusted_recipient(&wallet, &recipient);
+
+    let before_flagging = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(before_flagging, Decision::Allow);
+
+    client.add_flagged_address(&admin, &recipient);
+
+    let decision = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(
+        decision,
+        Decision::RequireStepUp(StepUpReason::FlaggedRecipient)
+    );
+}
+
+#[test]
+fn evaluate_stops_requiring_stepup_once_a_flagged_address_is_unflagged() {
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_policy(&wallet, &1_000, &5_000, &false, &5_000, &999_999_999);
+    client.add_flagged_address(&admin, &recipient);
+
+    let flagged = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(
+        flagged,
+        Decision::RequireStepUp(StepUpReason::FlaggedRecipient)
+    );
+
+    client.remove_flagged_address(&admin, &recipient);
+
+    let unflagged = client.evaluate(&wallet, &recipient, &10);
+    assert_eq!(unflagged, Decision::Allow);
+}
+
+#[test]
+fn evaluate_still_fails_with_policy_not_found_for_a_flagged_recipient() {
+    // The flagged check is checked first among the *decision* branches, but
+    // still comes after PolicyNotFound -- a wallet with no policy can't be
+    // evaluated at all, flagged recipient or not.
+    let (env, client, _contract_id, admin, reference_asset) = setup();
+    client.initialize(&admin, &reference_asset);
+
+    let wallet = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.add_flagged_address(&admin, &recipient);
+
+    let result = client.try_evaluate(&wallet, &recipient, &10);
+    assert_eq!(result, Err(Ok(WardenError::PolicyNotFound)));
+}
