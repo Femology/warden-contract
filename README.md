@@ -43,8 +43,8 @@ evaluate(wallet, recipient, amount)       →  reads Policy + VelocityWindow(Add
 get_policy, get_velocity                  →  public reads, no auth
 ```
 
-Full function-by-function reference, the event table, and the stated v1 limitation
-(fixed velocity window, not sliding) are below in [Reference](#reference).
+Full function-by-function reference, the event table, and the stated v1 limitations
+(fixed, not sliding, velocity windows) are below in [Reference](#reference).
 
 ## Quickstart
 
@@ -87,8 +87,10 @@ pub struct Policy {
     pub owner: Address,
     pub max_no_stepup: i128,               // per-tx ceiling before step-up is required
     pub daily_velocity_cap: i128,          // cumulative ceiling per rolling 24h window
+    pub hourly_velocity_cap: i128,         // cumulative ceiling per rolling 1h window, <= daily_velocity_cap
     pub new_recipient_requires_stepup: bool,
-    pub trusted_recipients: Vec<Address>,
+    pub trusted_recipients: Map<Address, u64>, // recipient -> last_paid_at (ledger timestamp)
+    pub trust_decay_seconds: u64,          // how long trust survives without a payment
     pub updated_at: u64,
 }
 
@@ -107,8 +109,15 @@ pub enum StepUpReason {
     AmountExceeded,
     NewRecipient,
     VelocityExceeded,
+    HourlyVelocityExceeded,
 }
 ```
+
+Two separate `VelocityWindow` values are tracked per wallet — one resetting every 24h
+(`daily_velocity_cap`), one resetting every 1h (`hourly_velocity_cap`) — the same shape,
+different storage keys and reset periods. See
+[Phase 14: dual velocity windows and trust decay](#phase-14-dual-velocity-windows-and-trust-decay)
+below.
 
 All amounts are `i128`. No monetary value in this contract, or anything built on top of
 it, is ever represented as a float.
@@ -119,15 +128,18 @@ it, is ever represented as a float.
 One-time setup at deploy. Requires `admin` auth. Fails with `AlreadyInitialized` if
 called twice.
 
-#### `set_policy(wallet: Address, max_no_stepup: i128, daily_velocity_cap: i128, new_recipient_requires_stepup: bool)`
-Requires `wallet` auth. Creates a policy if none exists, or updates the three threshold
-fields in place if one does — `trusted_recipients` is untouched by this call. Rejects with
-`InvalidPolicyParams` if `max_no_stepup < 0` or `daily_velocity_cap < max_no_stepup`.
-Emits `policy_set`.
+#### `set_policy(wallet: Address, max_no_stepup: i128, daily_velocity_cap: i128, new_recipient_requires_stepup: bool, hourly_velocity_cap: i128, trust_decay_seconds: u64)`
+Requires `wallet` auth. Creates a policy if none exists, or updates these five
+configurable fields in place if one does — `trusted_recipients` itself is untouched by
+this call, only managed by the two functions below. Rejects with `InvalidPolicyParams`
+if `max_no_stepup < 0`, `daily_velocity_cap < max_no_stepup`, `hourly_velocity_cap < 0`,
+or `hourly_velocity_cap > daily_velocity_cap` (allowing more per hour than per day would
+make the hourly cap meaningless). Emits `policy_set`.
 
 #### `add_trusted_recipient(wallet: Address, recipient: Address)`
 Requires `wallet` auth and an existing policy (`PolicyNotFound` otherwise). Fails with
-`RecipientAlreadyTrusted` if already present. Emits `recipient_trusted`.
+`RecipientAlreadyTrusted` if already present. Sets `last_paid_at` to the current ledger
+time — fresh, not decayed. Emits `recipient_trusted`.
 
 #### `remove_trusted_recipient(wallet: Address, recipient: Address)`
 Requires `wallet` auth and an existing policy. Fails with `RecipientNotTrusted` if the
@@ -139,16 +151,24 @@ The core function, called at the moment a transfer is attempted. Requires `walle
 1. Loads the wallet's policy (`PolicyNotFound` if none is set — an unconfigured wallet
    gets an explicit error, not a silent default).
 2. Validates `amount > 0` (`InvalidAmount` otherwise).
-3. Loads (or starts fresh) the velocity window, resetting it if 24 hours have passed
-   since `window_start`.
-4. Decides, checking in this order and returning on first match: new untrusted recipient
-   → step-up; amount over `max_no_stepup` → step-up; cumulative spend over
-   `daily_velocity_cap` → step-up; otherwise → allow.
-5. Updates the velocity window **regardless of the decision**. A transfer that triggered
-   step-up and was then completed still happened and must count toward the cap —
-   otherwise someone could reset their effective velocity limit just by making every
-   transfer trigger step-up.
-6. Emits `evaluation_allowed` or `stepup_required`.
+3. Loads (or starts fresh) both the daily and hourly velocity windows, resetting each
+   independently if its own period has elapsed since its `window_start`.
+4. Checks whether `recipient` counts as actively trusted: present in
+   `trusted_recipients` **and** `now - last_paid_at <= trust_decay_seconds`. A recipient
+   past that age is still in the list (unaffected by `add`/`remove_trusted_recipient`),
+   it just no longer counts as trusted for this check.
+5. Decides, checking in this order and returning on first match: new/decayed-untrusted
+   recipient → step-up; amount over `max_no_stepup` → step-up; cumulative hourly spend
+   over `hourly_velocity_cap` → step-up; cumulative daily spend over
+   `daily_velocity_cap` → step-up; otherwise → allow. When both velocity windows are
+   exceeded at once, the hourly reason is reported — it's the more specific, more
+   immediately actionable signal.
+6. Updates **both** velocity windows regardless of the decision, and refreshes
+   `last_paid_at` for an already-trusted recipient regardless of the decision — same
+   reasoning throughout: a transfer that triggered step-up and was then completed still
+   happened, and must count. This does not touch `updated_at`, which means "the owner
+   changed their policy configuration," not "a payment happened."
+7. Emits `evaluation_allowed` or `stepup_required`.
 
 #### `get_policy(wallet: Address) -> Policy`
 Public read, no auth. `PolicyNotFound` if none is set. Policy data isn't secret — it's
@@ -163,7 +183,7 @@ read, not a missing-configuration error.
 
 | Event | Topics | Data |
 |---|---|---|
-| `policy_set` | `("policy_set", wallet)` | `(max_no_stepup, daily_velocity_cap, new_recipient_requires_stepup)` |
+| `policy_set` | `("policy_set", wallet)` | `(max_no_stepup, daily_velocity_cap, hourly_velocity_cap, new_recipient_requires_stepup, trust_decay_seconds)` |
 | `recipient_trusted` | `("recipient_trusted", wallet)` | `recipient` |
 | `recipient_untrusted` | `("recipient_untrusted", wallet)` | `recipient` |
 | `evaluation_allowed` | `("eval_allowed", wallet)` | `(recipient, amount)` |
@@ -175,14 +195,48 @@ These are built with soroban-sdk's `#[contractevent]` macro rather than the depr
 event indexer (`warden-monitor`) decodes against these literal topic names and positional
 data, so they're treated as a stable interface, not an implementation detail.
 
-### Known limitation: fixed velocity window, not a sliding one
+### Known limitation: fixed velocity windows, not sliding ones
 
-The 24-hour window resets on expiry (`now - window_start >= 86400`) rather than sliding
-continuously. A wallet could in principle spend up to its daily cap just before a reset,
-then again just after — briefly doubling its effective velocity limit across that
-boundary. This is a deliberate v1 simplification, not an oversight. A continuously
-sliding window is a reasonable follow-up if this edge case matters for a given
-deployment's risk tolerance.
+Both the 24-hour and 1-hour windows reset on expiry (`now - window_start >= period`)
+rather than sliding continuously. A wallet could in principle spend up to a cap just
+before a reset, then again just after — briefly doubling its effective limit across
+that boundary. This applies independently to each window. This is a deliberate v1
+simplification, not an oversight. A continuously sliding window is a reasonable
+follow-up if this edge case matters for a given deployment's risk tolerance.
+
+### Phase 14: dual velocity windows and trust decay
+
+Added after v0.1.0. Extends the same contract — see
+[11-warden-feature-roadmap-phases-14-19.md](https://github.com/Femology/warden-planning/blob/main/11-warden-feature-roadmap-phases-14-19.md)
+in `warden-planning` for the full rationale. Two things changed:
+
+1. **A second, hourly velocity window** (`hourly_velocity_cap`, reset every 3600s)
+   alongside the existing daily one, catching rapid-fire spending that a 24h cap alone
+   wouldn't flag until far more had been spent. See `StepUpReason::HourlyVelocityExceeded`.
+2. **Trust decay.** `trusted_recipients` now tracks *when* each recipient was last paid,
+   not just whether they're trusted. A recipient who hasn't been paid in
+   `trust_decay_seconds` no longer skips the new-recipient step-up, without needing to
+   be explicitly removed and re-added.
+
+#### Migration note — this is a breaking storage schema change
+
+`Policy.trusted_recipients` changed type (`Vec<Address>` → `Map<Address, u64>`) and the
+struct gained two new fields (`hourly_velocity_cap`, `trust_decay_seconds`). Soroban
+contract storage decodes by the exact shape the currently-deployed wasm expects — **a
+policy stored under the pre-Phase-14 contract cannot be read by this version**, and
+there is no in-place upgrade path (this contract deliberately has no admin-upgrade
+function, by design — see Scope below).
+
+Concretely: `warden-contract`'s v0.1.0 Testnet deployment
+(`CBFQ752LFNC57U4KWDAEKNU43PLBWJ7M2B4ZRYUMCWL62JHJNUYJVMB5`) already has real policy
+data under the old schema (from earlier testing). Deploying this Phase 14 code means a
+**new contract instance, a new contract ID** — not an upgrade of the existing one.
+Every wallet, including that Testnet one, needs to call `set_policy` again from
+scratch under the new deployment; nothing carries over automatically. This is
+acceptable for Testnet with no real funds at stake and no migration tooling built for
+v1 — it would not be acceptable for a Mainnet deployment with real user data, which is
+exactly the kind of gap a real migration tool or an upgrade mechanism would need to
+close before this contract is used for anything beyond Testnet.
 
 ### Tech stack
 
